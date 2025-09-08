@@ -1,0 +1,41 @@
+# どのタスクか（OBB固定でOK）
+task: obb
+
+# 1つだけ書くなら model: に指定、複数回すなら models: に列挙（両方書いたら models を優先）
+model: yolo11n-obb.pt
+models: []   # 例: ["yolo11n-obb.pt", "yolo11s-obb.pt"]
+
+# YOLOの出力先
+project: runs_obb
+name_prefix: fold
+device: 0            # 単一GPU: 0 / 複数: "0,1"
+
+# train に必須/頻出のものはここに。任意キーは全部 yolo CLI に直渡しされます。
+train:
+  epochs: 120
+  imgsz: 1280
+  batch: 16
+  seed: 0
+  cos_lr: true
+  warmup_epochs: 3
+  # 画像拡張
+  degrees: 180
+  fliplr: 0.5
+  flipud: 0.5
+  shear: 5
+  mosaic: 1.0
+  close_mosaic: 10
+  # 学習率など（必要なら）
+  # lr0: 0.01
+  # lrf: 0.01
+
+# 検証（val split）の追加オプション
+val:
+  save_txt: false
+  save_json: false
+
+# テスト（test split）用の追加オプション。split=test をここで入れておく
+test:
+  split: test
+  save_txt: true     # 必要に応じて
+  save_json: false
