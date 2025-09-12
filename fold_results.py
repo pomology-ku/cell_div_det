@@ -1,31 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-学習に使った YAML (train cfg) を読み、[] で指定されたスイープ軸に基づき自動集計するスクリプト
+aggregate_from_train_cfg.py (v2)
 
-・やること
-  - --train_cfg で与えたYAMLから、trainセクション内の「値がリスト」のキーをスイープ軸として抽出（例: imgsz, hsv_v, hsv_s）
-  - models（または model）もスイープ軸として扱う（models がリストなら models 軸、なければ単一 model を固定値）
-  - project 配下の run ディレクトリを走査し、各 run の args.yaml/hyp.yaml を読み、
-      軸キー（例: model/imgsz/hsv_v/hsv_s）を取得（不足時はexp名からフォールバック抽出）
-  - 各 run の results.csv から mAP50-95/mAP50 のベスト値を取得
-  - 軸ごとに集計CSVを自動生成（「軸=1個」「全軸の組合せ」）
-  - 期待グリッド（全組合せ）に対して、見つかった本数/不足（カバレッジ）もCSVに出す
+- train.yaml のリスト軸に加え、各 run の args.yaml / hyp.yaml を総当りで走査し、
+  実際に値が変わっているキーを “自動軸” として追加採用（例: mosaic, shear, translate, scale, mixup, flip系 等）
+- 値が2種類以上のキーのみを “軸” にするため、勝手にノイズ列が増えない
+- 浮動小数は丸めて group 化（例: 0.1500001 と 0.15 を同一視）
 
-・出力
-  - summary_per_run.csv                 : 走査した run 一覧（軸の値＋指標）
-  - summary_by_<axis>.csv               : 各軸ごとの平均・標準偏差（例: summary_by_model.csv, summary_by_imgsz.csv）
-  - summary_by_all_axes.csv             : 全軸の組み合わせ別平均（クロス集計）
-  - expected_grid_coverage.csv          : 期待グリッドと実際のカバレッジ（何本見つかったか、不足の有無）
-
-使い方:
-  python aggregate_from_train_cfg.py \
-    --project runs_obb \
-    --out_dir reports_sem \
-    --train_cfg hyperparams.yaml \
-    --name_prefix exp004_hsv    # 任意。prefixで対象実験を限定したい場合
-
-必要: pandas, pyyaml
+出力は従来と同じ:
+  - summary_per_run.csv
+  - summary_by_<axis>.csv （自動軸含む）
+  - summary_by_all_axes.csv（採用軸が2つ以上ある時）
+  - expected_grid_coverage.csv（train.yaml のリスト軸のみを対象）
 """
 
 import argparse
@@ -34,23 +21,50 @@ from pathlib import Path
 from itertools import product
 import yaml
 import pandas as pd
+import math
 
 # ====== Ultralyticsの列候補（版差に対応） ======
 MAP5095_CANDIDATES = [
     "metrics/mAP50-95(OBB)", "metrics/mAP50-95(B)", "metrics/mAP50-95",
-    "mAP50-95(OBB)", "mAP50-95(B)", "mAP50-95"
+    "mAP50-95(OBB)", "mAP50-95(B)", "mAP50-95", "map"  # map=0.5:0.95
 ]
 MAP50_CANDIDATES = [
     "metrics/mAP50(OBB)", "metrics/mAP50(B)", "metrics/mAP50",
-    "mAP50(OBB)", "mAP50(B)", "mAP50"
+    "mAP50(OBB)", "mAP50(B)", "mAP50", "map50"
 ]
 EPOCH_COLS = ["epoch", "Epoch", "epochs"]
 
-# ====== 名称フォールバック（足りないときだけ使用） ======
+# ====== 自動で拾いたいキー候補（run 側から読む） ======
+SCAN_KEYS = [
+    # geometry aug
+    "degrees", "shear", "translate", "scale", "perspective",
+    "fliplr", "flipud",
+    # mosaic/mixup 他
+    "mosaic", "close_mosaic", "mixup", "copy_paste",
+    # color aug（電顕なら0推奨でも、変えているなら拾う）
+    "hsv_h", "hsv_s", "hsv_v",
+    # size/epochsなど
+    "imgsz", "img_size", "epochs", "batch",
+    # nms系（args.yaml側）
+    "iou", "conf", "agnostic_nms", "augment",
+    # 学習率系（変えてたら拾う）
+    "lr0", "lrf", "cos_lr", "momentum", "weight_decay",
+    # focal loss系
+    "fl_gamma", "fl_alpha",
+]
+
+ALIASES = {
+    "fl_alpha": ["fl_alpha", "focal_alpha", "alpha", "loss.alpha", "loss.focal.alpha", "focal.alpha"],
+    "fl_gamma": ["fl_gamma", "focal_gamma", "gamma", "loss.gamma", "loss.focal.gamma", "focal.gamma"],
+}
+
 NAME_PATTERNS = [
     re.compile(r".*_(?P<model>yolo\d+[nslmx]-obb).*_i(?P<imgsz>\d+)", re.IGNORECASE),
     re.compile(r"fold(?P<fold>\d+)[_\-]+(?P<model>[^_]+)[_\-]+e(?P<epochs>\d+)[_\-]+i(?P<imgsz>\d+)", re.IGNORECASE),
+    re.compile(r".*_fl[_-]?alpha(?P<fl_alpha>\d+(?:\.\d+)?)", re.IGNORECASE),
+    re.compile(r".*_fl[_-]?gamma(?P<fl_gamma>\d+(?:\.\d+)?)", re.IGNORECASE),
 ]
+
 
 def load_yaml_safe(p: Path):
     try:
@@ -60,7 +74,7 @@ def load_yaml_safe(p: Path):
         return {}
     return {}
 
-def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+def find_col(df: pd.DataFrame, candidates):
     for c in candidates:
         if c in df.columns:
             return c
@@ -97,7 +111,7 @@ def get_best_metrics(df: pd.DataFrame) -> dict:
     return out
 
 def parse_name_fallback(name: str) -> dict:
-    info = {"model": None, "imgsz": None}
+    info = {"model": None, "imgsz": None, "fl_alpha": None, "fl_gamma": None}
     for pat in NAME_PATTERNS:
         m = pat.match(name)
         if m:
@@ -106,42 +120,107 @@ def parse_name_fallback(name: str) -> dict:
             if gd.get("imgsz"):
                 try: info["imgsz"] = int(gd["imgsz"])
                 except: pass
-            break
+            if gd.get("fl_alpha"):
+                try: info["fl_alpha"] = float(gd["fl_alpha"])
+                except: pass
+            if gd.get("fl_gamma"):
+                try: info["fl_gamma"] = float(gd["fl_gamma"])
+                except: pass
     return info
 
+
+def coerce_num(x):
+    """可能なら数値へ。小数は丸めて安定化（4桁）。"""
+    try:
+        if isinstance(x, bool):
+            return int(x)
+        if isinstance(x, (int, float)):
+            return int(x) if float(x).is_integer() else round(float(x), 4)
+        # 文字列
+        sx = str(x).strip()
+        if sx.lower() in {"true","false"}:
+            return 1 if sx.lower()=="true" else 0
+        if re.match(r"^-?\d+$", sx):
+            return int(sx)
+        if re.match(r"^-?\d+\.\d+$", sx):
+            return round(float(sx), 4)
+        return x
+    except Exception:
+        return x
+
 def load_run_axes(run_dir: Path) -> dict:
-    """args.yaml/hyp.yaml から軸候補を拾い、無ければ名前から補完"""
+    """args.yaml/hyp.yaml から可能な限り拾い、数値に整形（ネスト対応）。"""
     argsy = load_yaml_safe(run_dir / "args.yaml")
     hypy  = load_yaml_safe(run_dir / "hyp.yaml")
-    merged = {**hypy, **argsy}
+    # args を優先（CLI > hyp）したいなら右側に hypy をマージ
+    merged = {}
+    # まず単純マージ（トップレベル）
+    if isinstance(hypy, dict):
+        merged.update(hypy)
+    if isinstance(argsy, dict):
+        merged.update(argsy)
+
     out = {}
-    # よく使うキー
-    if "model" in merged: out["model"] = merged.get("model")
-    if "imgsz" in merged: out["imgsz"] = merged.get("imgsz")
-    if "img_size" in merged and "imgsz" not in out: out["imgsz"] = merged.get("img_size")
-    if "hsv_v" in merged: out["hsv_v"] = merged.get("hsv_v")
-    if "hsv_s" in merged: out["hsv_s"] = merged.get("hsv_s")
-    if "degrees" in merged: out["degrees"] = merged.get("degrees")
+
+    # model / imgsz はトップ・ネスト両方から拾う
+    for key, aliases in {
+        "model": ["model"],
+        "imgsz": ["imgsz", "img_size", "img-size", "img", "img_size_train"],
+    }.items():
+        _, v = _deep_find_any(merged, aliases)
+        if v is not None:
+            out[key] = v
+
+    # スキャンキー（トップでもネストでも）
+    for k in SCAN_KEYS:
+        v = _deep_find_key(merged, k)
+        if v is not None:
+            out[k] = v
+
+    # 別名対応（focal/loss 下にあるケース）
+    for norm_key, alias_keys in ALIASES.items():
+        if norm_key not in out:
+            _, v = _deep_find_any(merged, alias_keys)
+            if v is not None:
+                out[norm_key] = v
+
     # 型整形
-    for k in ["imgsz","degrees"]:
-        try:
-            if k in out and out[k] is not None:
-                out[k] = int(out[k])
-        except Exception:
-            pass
-    for k in ["hsv_v","hsv_s"]:
-        try:
-            if k in out and out[k] is not None:
-                out[k] = float(out[k])
-        except Exception:
-            pass
-    # フォールバック
+    for k, v in list(out.items()):
+        out[k] = coerce_num(v)
+
+    # フォールバック（run名から）
     fb = parse_name_fallback(run_dir.name)
-    if "model" not in out or out["model"] is None:
-        out["model"] = fb.get("model")
-    if "imgsz" not in out or out["imgsz"] is None:
-        out["imgsz"] = fb.get("imgsz")
+    for k in ("model", "imgsz", "fl_alpha", "fl_gamma"):
+        if (k not in out) or (out[k] in (None, "")):
+            if fb.get(k) not in (None, ""):
+                out[k] = fb[k]
+
     return out
+
+def _deep_find_key(d, key):
+    """辞書/リストを再帰的に探索して最初に見つかった key の値を返す。見つからなければ None。"""
+    if isinstance(d, dict):
+        if key in d:
+            return d[key]
+        for v in d.values():
+            res = _deep_find_key(v, key)
+            if res is not None:
+                return res
+    elif isinstance(d, list):
+        for e in d:
+            res = _deep_find_key(e, key)
+            if res is not None:
+                return res
+    return None
+
+def _deep_find_any(d, keys):
+    """keys のいずれかが見つかったら (見つかったキー名, 値) を返す。無ければ (None, None)。"""
+    for k in keys:
+        v = _deep_find_key(d, k)
+        if v is not None:
+            return k, v
+    return None, None
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -149,42 +228,35 @@ def main():
     ap.add_argument("--out_dir", "-o", default="reports", help="出力ディレクトリ")
     ap.add_argument("--train_cfg", "-c", required=True, help="学習に使った YAML（スイープ軸はこの中のリスト）")
     ap.add_argument("--name_prefix", "-n", default="", help="対象runの名前プレフィックス（空なら全件）")
+    ap.add_argument("--discover_all", action="store_true",
+                    help="train.yamlに無いキーでも、runを走査して値が2種類以上あれば自動軸として加える")
     args = ap.parse_args()
 
     project = Path(args.project)
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ==== 1) 学習YAMLからスイープ軸を抽出 ====
+    # ==== 1) 学習YAMLから “期待軸” を抽出 ====
     cfg = yaml.safe_load(Path(args.train_cfg).read_text(encoding="utf-8")) or {}
     train_hp = cfg.get("train", {}) or {}
-    # 軸候補: train内で「値がリスト」のキー
-    sweep_axes = [k for k, v in train_hp.items() if isinstance(v, (list, tuple)) and len(v) > 0]
-    # モデル軸（modelsがあればそれ、無ければ単一modelを固定値）
-    models = cfg.get("models", [])
-    if models:
-        sweep_axes = ["model"] + sweep_axes
-        expected_values = {"model": list(models)}
-    else:
-        # model が単一なら固定値として扱う（軸にはしない）
-        expected_values = {}
-    # 各軸の期待値集合
-    for k in train_hp:
-        v = train_hp[k]
+    expected_values = {}
+    base_axes = []
+
+    for k, v in train_hp.items():
         if isinstance(v, (list, tuple)) and len(v) > 0:
-            # 数値は int/float 正規化（比較ブレ回避）
-            vs = []
-            for e in v:
-                try:
-                    if isinstance(e, str) and e.isdigit():
-                        vs.append(int(e))
-                    else:
-                        vs.append(float(e) if isinstance(e, (int,float)) or "." in str(e) else int(e))
-                except Exception:
-                    vs.append(e)
+            base_axes.append(k)
+            # 値を数値に正規化して保存
+            vs = [coerce_num(e) for e in v]
             expected_values[k] = vs
 
-    # ==== 2) run を走査して、軸値＋metrics を収集 ====
+    models = cfg.get("models", [])
+    if models:
+        base_axes = ["model"] + base_axes
+        expected_values["model"] = list(models)
+
+    # ==== 2) runs を走査し、各 run の軸候補＋metrics を収集 ====
     rows = []
+    runs_axes_values = {}  # 軸 -> 異なる値セット（自動軸の抽出用）
+
     for run_dir in sorted(project.glob("*")):
         if not run_dir.is_dir():
             continue
@@ -193,31 +265,30 @@ def main():
         if not (run_dir / "weights" / "best.pt").exists():
             continue
 
-        df = None
         csv_path = run_dir / "results.csv"
-        if csv_path.exists():
-            try:
-                df = pd.read_csv(csv_path)
-            except Exception:
-                pass
-        if df is None or df.empty:
+        if not csv_path.exists():
+            continue
+        try:
+            rdf = pd.read_csv(csv_path)
+        except Exception:
+            continue
+        if rdf is None or rdf.empty:
             continue
 
         axes_in_run = load_run_axes(run_dir)
-        best = get_best_metrics(df)
+        best = get_best_metrics(rdf)
 
         row = {"exp_name": run_dir.name, "exp_path": str(run_dir)}
-        # まずは全軸を None で用意
-        for ax in sweep_axes:
-            row[ax] = None
+        # まずは基軸（train.yaml 由来）
+        for ax in base_axes:
+            row[ax] = axes_in_run.get(ax, None)
 
-        # 値を埋める（args優先）
-        for ax in sweep_axes:
-            if ax in axes_in_run and axes_in_run[ax] is not None:
-                row[ax] = axes_in_run[ax]
-            # trainのキー名と run 側のキー名が違う場合の素直マッピング
-            if row[ax] is None and ax == "imgsz" and "imgsz" in axes_in_run:
-                row[ax] = axes_in_run["imgsz"]
+        # SCAN_KEYS も含め、run から拾えた全キーを候補に
+        for k, v in axes_in_run.items():
+            row[k] = v
+            if k not in runs_axes_values:
+                runs_axes_values[k] = set()
+            runs_axes_values[k].add(v)
 
         # metrics
         row.update({
@@ -234,14 +305,34 @@ def main():
 
     df = pd.DataFrame(rows)
 
-    # 型の揺れを整える（比較しやすく）
+    # ==== 3) “自動軸” を決定（discover_all 有効時） ====
+    sweep_axes = list(dict.fromkeys(base_axes))  # 重複排除を保ったまま
+    if args.discover_all:
+        for k, vals in runs_axes_values.items():
+            if k in sweep_axes:
+                continue
+            # None/NaN を除いたユニーク数
+            uniq = {x for x in vals if x is not None and (not (isinstance(x, float) and math.isnan(x)))}
+            if len(uniq) >= 2:
+                sweep_axes.append(k)
+
+    # 列の型を安定化（数値化）
     for ax in sweep_axes:
         if ax in df.columns:
-            # 数値っぽければ数値化
             try:
-                df[ax] = pd.to_numeric(df[ax], errors="ignore")
+                df[ax] = df[ax].apply(coerce_num)
             except Exception:
                 pass
+
+    # 小数は丸め直し（グルーピング安定化）
+    def _round_if_float_series(s: pd.Series):
+        try:
+            return s.apply(lambda x: round(x, 4) if isinstance(x, float) else x)
+        except Exception:
+            return s
+    for ax in sweep_axes:
+        if ax in df.columns:
+            df[ax] = _round_if_float_series(df[ax])
 
     # 保存：全runの一覧
     per_run_csv = out_dir / "summary_per_run.csv"
@@ -251,7 +342,7 @@ def main():
     # スコア列（mAP50-95優先、無ければmAP50）
     df["score_for_group"] = df["best_mAP50-95"].fillna(df["best_mAP50"])
 
-    # ==== 3) 軸ごとの自動集計（単軸） ====
+    # ==== 4) 軸ごとの自動集計（単軸） ====
     for ax in sweep_axes:
         if ax not in df.columns:
             continue
@@ -268,8 +359,8 @@ def main():
         g.to_csv(out, index=False)
         print(f"[OK] 保存: {out}")
 
-    # ==== 4) 全軸の組合せ集計 ====
-    if sweep_axes and all(ax in df.columns for ax in sweep_axes):
+    # ==== 5) 全軸の組合せ集計（採用軸が2つ以上あるとき） ====
+    if len(sweep_axes) >= 2 and all(ax in df.columns for ax in sweep_axes):
         g = df.groupby(sweep_axes, dropna=False).agg(
             n=("score_for_group","count"),
             mean=("score_for_group","mean"),
@@ -283,8 +374,7 @@ def main():
         g.to_csv(out, index=False)
         print(f"[OK] 保存: {out}")
 
-    # ==== 5) 期待グリッドに対するカバレッジ ====
-    # expected_values が空ならスキップ（全軸にリストが無い場合）
+    # ==== 6) 期待グリッドに対するカバレッジ（train.yamlのリスト軸のみ） ====
     if expected_values:
         keys = list(expected_values.keys())
         grid = list(product(*[expected_values[k] for k in keys]))
@@ -294,8 +384,7 @@ def main():
             for k, v in zip(keys, vals):
                 if k in df.columns:
                     mask &= (df[k] == v)
-            found = int(mask.sum())
-            recs.append({**{k: v for k, v in zip(keys, vals)}, "found_runs": found})
+            recs.append({**{k: v for k, v in zip(keys, vals)}, "found_runs": int(mask.sum())})
         cov = pd.DataFrame(recs)
         out_cov = out_dir / "expected_grid_coverage.csv"
         cov.to_csv(out_cov, index=False)
@@ -312,9 +401,6 @@ def main():
     if (out_dir / "summary_by_all_axes.csv").exists():
         print("\n=== (preview) by ALL axes ===")
         print(pd.read_csv(out_dir / "summary_by_all_axes.csv").head(20).to_string(index=False))
-    if expected_values:
-        print("\n=== (preview) expected grid coverage ===")
-        print(pd.read_csv(out_dir / "expected_grid_coverage.csv").to_string(index=False))
 
 if __name__ == "__main__":
     main()
