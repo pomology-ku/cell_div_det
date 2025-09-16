@@ -48,14 +48,19 @@ def get_primary_class_from_yolo_obb(label_path: Path, mode: str = "first") -> st
         if cid in cands: return cid
     return first or "NEG"
 
-def load_names_from_yaml(yaml_path: Path):
-    if not yaml_path.exists(): return None, None
+def load_meta_from_yaml(yaml_path: Path):
+    """source_yaml から names, nc, channels を読み取る（存在するものだけ返す）"""
+    if not yaml_path.exists():
+        return None, None, None
     try:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
     except Exception as e:
         print(f"[WARN] data.yaml を読み取れませんでした: {e}", file=sys.stderr)
-        return None, None
-    return data.get("names", None), data.get("nc", None)
+        return None, None, None
+    names = data.get("names", None)
+    nc = data.get("nc", None)
+    channels = data.get("channels", None)  # ★ 追加
+    return names, nc, channels
 
 def write_list_txt(base_dir: Path, file_path: Path, image_paths_abs: list[Path]):
     rels = [str(p.relative_to(base_dir)).replace(os.sep, "/") for p in image_paths_abs]
@@ -99,7 +104,7 @@ def main():
     assert cv_img_dir.exists() and cv_lab_dir.exists(), "cv_pool/images と cv_pool/labels が必要です"
     assert test_img_src.exists() and test_lab_src.exists(), "test/images と test/labels が必要です"
 
-    names, nc = load_names_from_yaml(Path(args.source_yaml))
+    names, nc, channels = load_meta_from_yaml(Path(args.source_yaml))
 
     # cv_pool を収集
     cv_imgs = collect_images_recursive(cv_img_dir)
@@ -182,6 +187,7 @@ def main():
                      "test": str((fold_dir/"test").resolve())}
         if names is not None: data_yaml["names"] = names
         if nc is not None:    data_yaml["nc"] = nc
+        if channels is not None: data_yaml["channels"] = channels
         (fold_dir/"data.yaml").write_text(yaml.safe_dump(data_yaml, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
         print(f"Fold{k}: train={len(train_imgs_out)}  val={len(val_imgs_out)}  test={len(test_imgs_out)}")
