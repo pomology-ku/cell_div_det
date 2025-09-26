@@ -2,45 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 Merge multiple tiles into a single mosaic using JEOL MappingInformation XML
-and overlay COCO (AABB) detections on top.
+and overlay COCO (AABB) detections on top. (GT overlay optional)
 
 - XML: expects <Kobetu ... ImagePath="X042 Y001.tif" OffsetX="0" OffsetY="0" ImageWidth/Height=...>
-- COCO: produced by export_coco_from_yolo_obb.py (bbox = [x, y, w, h], AABB in pixel coords). 
+- COCO: produced by export_coco_from_yolo_obb.py (bbox = [x, y, w, h], AABB in pixel coords).
         images[].file_name may be written without extension depending on --no-strip-ext.
+- GT (optional): YOLO-OBB label files under --gt-dir (recursive). Supported formats per line:
+    (A) cls x1 y1 x2 y2 x3 y3 x4 y4   # 8点ポリゴン (正規化 0..1)
+    (B) cls xc yc w h angle_rad        # 中心・幅高・角度 (正規化, ラジアン)
 
-Features
---------
-* Robust matching between COCO images[] and XML tiles by basename (with/without extension).
-* Handles negative offsets; auto-shifts to positive canvas coordinates.
-* Downscaling options: fixed --scale OR fit into --max-width/--max-height while preserving aspect.
-* BBox styling: color per class (deterministic), alpha fill, line thickness, optional labels.
-* Optional tile border overlay and per-tile index label for debugging.
-
-Usage examples
---------------
-  python mosaic_coco_overlay.py \
-      --xml MappingInformation.xml \
-      --coco coco.json \
-      --img-root /path/to/tiles \
-      --out mosaic.png \
-      --max-width 6000 --max-height 6000 \
-      --line 3 --alpha 64 --show-label class_name
-
-  # Fixed downscale (e.g., 0.25x) regardless of size
-  python mosaic_coco_overlay.py --xml map.xml --coco coco.json \
-      --img-root . --out mosaic_25.png --scale 0.25
-
-Notes
------
-* Paste order: sorted by (IndexY, IndexX) if available, else by ImagePath.
-* Overlaps are pasted in that order (later tiles overwrite earlier pixels).
-* Colors are hashed from category_id and stable across runs.
+New options:
+  --gt-dir PATH           : provide to overlay GT polygons
+  --gt-color R,G,B        : color for GT (default 255,0,255)
+  --gt-line INT           : line width for GT (default 3)
+  --gt-alpha INT          : fill alpha for GT (0..255, default 0 no fill)
 """
 
 import argparse
 import json
 import math
 import sys
+import re
 from collections import defaultdict
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -75,9 +57,7 @@ def choose_scale(canvas_w, canvas_h, scale_opt, max_w, max_h):
 
 
 def load_font(size: int):
-    # Try to load a common TrueType font; fallback to PIL default
     try:
-        # DejaVuSans is usually bundled with PIL
         return ImageFont.truetype("DejaVuSans.ttf", size)
     except Exception:
         return ImageFont.load_default()
@@ -85,10 +65,8 @@ def load_font(size: int):
 
 def hash_color(k: int):
     """Return a visually distinct RGB color from an integer key (category_id)."""
-    # Use golden ratio to distribute hues
     phi = (1 + 5 ** 0.5) / 2
     hue = (k * phi) % 1.0
-    # Convert HSV->RGB (simple)
     import colorsys
     r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 1.0)
     return (int(r * 255), int(g * 255), int(b * 255))
@@ -101,18 +79,20 @@ def normalize_key(path_like: str) -> str:
     return stem.lower()
 
 
+def parse_rgb(csv: str, default=(255, 0, 255)):
+    try:
+        a = [int(x.strip()) for x in csv.split(",")]
+        if len(a) != 3:
+            return default
+        return tuple(max(0, min(255, v)) for v in a)
+    except Exception:
+        return default
+
 # ------------------------- XML Parsing ---------------------------
 
 def parse_mapping_xml(xml_path: Path):
-    """Parse MappingInformation XML and return (tiles, meta).
-
-    Each tile dict has keys: image_path, w, h, offx, offy, idx_x, idx_y, id,
-    center_x, center_y, view_w, view_h
-    meta contains: x_is_reverse (bool or None)
-    """
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    # Root may have XIsReverse="True"
     x_is_reverse_attr = root.attrib.get("XIsReverse")
     x_is_reverse = None
     if isinstance(x_is_reverse_attr, str):
@@ -128,7 +108,6 @@ def parse_mapping_xml(xml_path: Path):
         idx_x = _safe_int(el.attrib.get("IndexX", 0))
         idx_y = _safe_int(el.attrib.get("IndexY", 0))
         kob_id = el.attrib.get("ID", "")
-        # Stage-based fields
         cx = _safe_float(el.attrib.get("X"), None)
         cy = _safe_float(el.attrib.get("Y"), None)
         vw = _safe_float(el.attrib.get("ViewWidth"), None)
@@ -142,18 +121,15 @@ def parse_mapping_xml(xml_path: Path):
             "center_x": cx, "center_y": cy,
             "view_w": vw, "view_h": vh,
         })
-    # sort for paste order
     tiles.sort(key=lambda t: (t["idx_y"], t["idx_x"], t["image_path"]))
     meta = {"x_is_reverse": x_is_reverse}
     return tiles, meta
-
 
 # ------------------------- COCO Parsing --------------------------
 
 def parse_coco(coco_path: Path):
     with open(coco_path, "r", encoding="utf-8") as f:
         coco = json.load(f)
-    # images: list of {id, file_name, width, height}
     img_by_id = {}
     imgs_by_key = defaultdict(list)
     for im in coco.get("images", []):
@@ -161,21 +137,83 @@ def parse_coco(coco_path: Path):
         key = normalize_key(im.get("file_name", ""))
         imgs_by_key[key].append(im)
 
-    # categories: id->name
     cat_name = {c["id"]: c.get("name", str(c["id"])) for c in coco.get("categories", [])}
-
-    # annotations grouped by image_id
     anns_by_img = defaultdict(list)
     for ann in coco.get("annotations", []):
         anns_by_img[ann["image_id"]].append(ann)
-
     return img_by_id, imgs_by_key, anns_by_img, cat_name
 
+# --------------------- YOLO-OBB GT utilities --------------------
+
+def strip_prefix(name: str, pattern: str) -> str:
+    """Remove leading prefix matched by regex pattern from a filename (no dirs, no ext)."""
+    return re.sub(pattern, '', name, count=1, flags=re.IGNORECASE)
+
+def build_gt_index(gt_root: Path, strip_regex: str):
+    """
+    Make a dict: stripped_stem(lower) -> [label_file_paths...]
+    - Strips leading prefix matched by strip_regex from file *stem* (basename without ext)
+    - Aggregates multiple files per stripped key
+    """
+    idx = defaultdict(list)
+    for p in gt_root.rglob("*.txt"):
+        base = p.name  # e.g., '332_X005 Y008.txt'
+        stem = base.rsplit(".", 1)[0]
+        stripped = strip_prefix(stem, strip_regex)
+        key = normalize_key(stripped)  # lower
+        idx[key].append(p)
+    return idx
+
+def parse_yolo_obb_line(line: str, tile_w: int, tile_h: int):
+    """
+    Returns polygon points in pixel coords: [(x1,y1),...,(x4,y4)]
+    Supports:
+      - cls x1 y1 x2 y2 x3 y3 x4 y4   (normalized)
+      - cls xc yc w h angle_rad       (normalized, radians)
+    """
+    parts = line.strip().split()
+    if not parts or parts[0].startswith("#"):
+        return None
+    if len(parts) not in (6, 9):  # 1+5 or 1+8
+        return None
+    try:
+        cls = int(float(parts[0]))  # not used here
+    except Exception:
+        return None
+
+    if len(parts) == 9:
+        vals = list(map(float, parts[1:9]))
+        x1,y1,x2,y2,x3,y3,x4,y4 = vals
+        pts = [
+            (x1 * tile_w, y1 * tile_h),
+            (x2 * tile_w, y2 * tile_h),
+            (x3 * tile_w, y3 * tile_h),
+            (x4 * tile_w, y4 * tile_h),
+        ]
+        return pts
+
+    # len==6 -> (xc,yc,w,h,angle)
+    _, xc, yc, w, h, a = parts
+    xc = float(xc) * tile_w
+    yc = float(yc) * tile_h
+    w  = float(w)  * tile_w
+    h  = float(h)  * tile_h
+    a  = float(a)  # radians
+    # rectangle corners around center before rotation
+    hw, hh = w / 2.0, h / 2.0
+    rect = [(-hw,-hh), ( hw,-hh), ( hw, hh), (-hw, hh)]
+    ca, sa = math.cos(a), math.sin(a)
+    pts = []
+    for (dx, dy) in rect:
+        rx = dx * ca - dy * sa + xc
+        ry = dx * sa + dy * ca + yc
+        pts.append((rx, ry))
+    return pts
 
 # -------------------------- Main Logic ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Merge tiles from XML and overlay COCO bboxes")
+    ap = argparse.ArgumentParser(description="Merge tiles from XML and overlay COCO bboxes (+ optional GT)")
     ap.add_argument("--xml", '-x', required=True, help="Path to MappingInformation XML")
     ap.add_argument("--coco", '-j', required=True, help="Path to COCO JSON (AABB)")
     ap.add_argument("--img-root", '-i', required=True, help="Directory containing tile images")
@@ -195,13 +233,21 @@ def main():
                    help="Flip stage X axis (mirror). 'auto' reads XML XIsReverse if present")
 
     # Drawing style
-    s = ap.add_argument_group("Overlay style")
+    s = ap.add_argument_group("Overlay style (detections)")
     s.add_argument("--line", type=int, default=3, help="BBox line thickness in output pixels")
     s.add_argument("--alpha", type=int, default=0, help="BBox fill alpha 0..255 (0=transparent)")
     s.add_argument("--show-label", choices=["none", "class_id", "class_name"], default="class_name", help="What label to draw on boxes")
     s.add_argument("--font-size", type=int, default=16, help="Label font size (after scaling)")
     s.add_argument("--tile-border", action="store_true", help="Draw tile borders for debugging")
     s.add_argument("--tile-label", action="store_true", help="Draw tile (IndexX,IndexY) label")
+
+    # GT overlay
+    gt = ap.add_argument_group("GT overlay (YOLO-OBB)")
+    gt.add_argument("--gt-dir", type=str, default=None, help="Root directory containing YOLO-OBB label files (recursive).")
+    gt.add_argument("--gt-color", type=str, default="255,0,255", help="GT RGB color as 'R,G,B' (default magenta)")
+    gt.add_argument("--gt-line", type=int, default=3, help="GT line width (pixels)")
+    gt.add_argument("--gt-alpha", type=int, default=0, help="GT fill alpha 0..255 (0=no fill)")
+    gt.add_argument("--gt-strip-prefix", type=str, default=r"^[0-9]+_", help="Regex to strip from the beginning of GT filenames (stem). Default: '^[0-9]+_'")
 
     args = ap.parse_args()
 
@@ -230,9 +276,8 @@ def main():
     else:
         x_rev = bool(meta.get("x_is_reverse")) if meta.get("x_is_reverse") is not None else False
 
-    # If stage-based placement, compute pixel-per-unit using view sizes
+    # Stage-to-pixel conversion
     def stage_to_px(t):
-        # Center coordinates in stage units, convert to pixel top-left using view size
         cx = t.get("center_x")
         cy = t.get("center_y")
         vw = t.get("view_w")
@@ -240,10 +285,8 @@ def main():
         if None in (cx, cy, vw, vh) or vw == 0 or vh == 0:
             return None
         sx = -cx if x_rev else cx
-        # pixels per stage-unit for this tile (usually constant across tiles)
         px_per_u_x = t["w"] / vw
         px_per_u_y = t["h"] / vh
-        # top-left in pixel coords (relative, will be shifted later)
         tlx = (sx - vw / 2.0) * px_per_u_x
         tly = (cy - vh / 2.0) * px_per_u_y
         return tlx, tly
@@ -255,7 +298,6 @@ def main():
         elif args.place_mode == "stage":
             st = stage_to_px(t)
             if st is None:
-                # Fallback to offsets if stage fields missing
                 x = t["offx"]; y = t["offy"]
             else:
                 x, y = st
@@ -271,7 +313,7 @@ def main():
         min_x = min(min_x, x)
         min_y = min(min_y, y)
         max_x = max(max_x, x + t["w"])
-        max_y = max(max_y, y + t["h"])    
+        max_y = max(max_y, y + t["h"])
 
     # Shift so min is 0,0
     shift_x = -min_x if min_x < 0 else 0
@@ -285,8 +327,7 @@ def main():
 
     scale = choose_scale(canvas_w, canvas_h, args.scale, args.max_width, args.max_height)
 
-    # Create canvas (8-bit grayscale or RGB)
-    # We don't know the tile mode; open first tile to decide
+    # Create canvas
     first_img_path = img_root / tiles[0]["image_path"]
     try:
         with Image.open(first_img_path) as im0:
@@ -308,6 +349,7 @@ def main():
                 out_full.paste(imt, (int(x + shift_x), int(y + shift_y)))
         except Exception as e:
             print(f"[WARN] Failed to paste {tile_path}: {e}")
+
     # Prepare scaled image and drawing context
     if scale != 1.0:
         new_w = max(1, int(round(canvas_w * scale)))
@@ -316,12 +358,12 @@ def main():
     else:
         out_scaled = out_full
 
-    # Ensure drawing surface supports RGBA (for colored/alpha overlays)
     if out_scaled.mode != "RGBA":
         out_scaled = out_scaled.convert("RGBA")
 
     draw = ImageDraw.Draw(out_scaled)
-    # Optionally draw tile borders/labels for debugging
+
+    # Debug tile borders/labels
     if args.tile_border or args.tile_label:
         font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
         for t, x, y in positions:
@@ -335,10 +377,10 @@ def main():
                 txt = f"({t['idx_x']},{t['idx_y']})"
                 draw.text((x0 + 4, y0 + 4), txt, fill=(255, 255, 0, 200), font=font)
 
-    # Build mapping from tile stem -> (offset, size)
+    # Build mapping stem -> (offset, size)
     tile_info = {}
     for t, x, y in positions:
-        key = normalize_key(t["image_path"])  # e.g., "x042 y001"
+        key = normalize_key(t["image_path"])
         tile_info[key] = {
             "shifted_x": x + shift_x,
             "shifted_y": y + shift_y,
@@ -347,23 +389,14 @@ def main():
             "path": str(img_root / t["image_path"]),
         }
 
-    # Draw COCO bboxes
+    # Draw COCO detections (AABB)
     font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
-
-    # Create mapping from COCO image entry -> tile_info
-    # The COCO may have file_name without ext or with a root prefix; we match by stem
-    # If multiple images share the same stem, we take the first match (and warn).
     matched = 0
     skipped = 0
-
     for img_id, im in list(img_by_id.items()):
         key = normalize_key(im.get("file_name", ""))
-        # If not found directly, try to strip any additional suffix/prefix heuristically
         tinfo = tile_info.get(key)
         if tinfo is None:
-            # Try with stem of basename again (already normalized). If still missing, skip.
-            # Optionally, try to match by exact filename including extension if present in XML
-            # (we already used stem which is the best we can do), so just warn.
             print(f"[WARN] No tile match for COCO image: file_name='{im.get('file_name')}' (key='{key}')")
             skipped += 1
             continue
@@ -381,7 +414,6 @@ def main():
             if not bbox or len(bbox) != 4:
                 continue
             x, y, w, h = bbox
-            # transform into mosaic coords
             gx0 = (ox + x) * scale
             gy0 = (oy + y) * scale
             gx1 = (ox + x + w) * scale
@@ -399,8 +431,6 @@ def main():
                     label = cat_name.get(cat_id, str(cat_id))
                 else:
                     label = str(cat_id)
-                # background box for readability
-                # text size (compat across Pillow versions)
                 try:
                     l, t, r, b = draw.textbbox((0, 0), label, font=font)
                     tw, th = (r - l), (b - t)
@@ -413,6 +443,64 @@ def main():
 
     print(f"[INFO] Matched COCO images to tiles: {matched}, skipped (no tile): {skipped}")
 
+    # --------------------- GT overlay (optional) ---------------------
+    if args.gt_dir:
+        gt_root = Path(args.gt_dir)
+        if not gt_root.exists():
+            print(f"[WARN] --gt-dir not found: {gt_root}")
+        else:
+            gt_index = build_gt_index(gt_root, args.gt_strip_prefix)
+            gt_color = parse_rgb(args.gt_color, default=(255, 0, 255))
+            gt_alpha = max(0, min(255, int(args.gt_alpha)))
+            gt_line = max(1, int(args.gt_line))
+
+            gt_found_tiles = 0
+            gt_missing_tiles = 0
+            total_gt_files_used = 0
+
+            for stem, tinfo in tile_info.items():
+                lbl_paths = gt_index.get(stem)
+                if not lbl_paths:
+                    gt_missing_tiles += 1
+                    continue
+
+                gt_found_tiles += 1
+                ox = tinfo["shifted_x"]; oy = tinfo["shifted_y"]
+                tw = tinfo["w"];         th = tinfo["h"]
+
+                # 同じ stem に複数 GT があれば全部重ねる
+                for lbl_path in lbl_paths:
+                    try:
+                        with open(lbl_path, "r", encoding="utf-8") as f:
+                            lines = f.readlines()
+                    except Exception as e:
+                        print(f"[WARN] Failed to read GT file {lbl_path}: {e}")
+                        continue
+
+                    used_any = False
+                    for ln in lines:
+                        poly = parse_yolo_obb_line(ln, tw, th)
+                        if not poly:
+                            continue
+                        poly_scaled = [((ox + px) * scale, (oy + py) * scale) for (px, py) in poly]
+                        if gt_alpha > 0:
+                            draw.polygon(poly_scaled, fill=(gt_color[0], gt_color[1], gt_color[2], gt_alpha))
+                        draw.polygon(poly_scaled, outline=(gt_color[0], gt_color[1], gt_color[2], 255))
+                        if gt_line > 1:
+                            for i in range(4):
+                                x0, y0 = poly_scaled[i]
+                                x1, y1 = poly_scaled[(i + 1) % 4]
+                                draw.line([x0, y0, x1, y1],
+                                        fill=(gt_color[0], gt_color[1], gt_color[2], 255),
+                                        width=gt_line)
+                        used_any = True
+
+                    if used_any:
+                        total_gt_files_used += 1
+
+            print(f"[INFO] GT overlay: tiles matched {gt_found_tiles}, tiles without GT {gt_missing_tiles}, "
+                f"GT files used {total_gt_files_used}")
+
     # Save
     out_scaled.save(out_path)
     print(f"[OK] Wrote mosaic with overlays: {out_path}  (scale={scale:.4f}, canvas={canvas_w}x{canvas_h})")
@@ -420,3 +508,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
