@@ -164,13 +164,13 @@ def main():
 
                 # === val on val split ===
                 best = Path(project) / exp_name / "weights" / "best.pt"
-                merged_val = {"data": str(data_yaml), "model": str(best), **val_hp}
+                merged_val  = {"data": str(data_yaml), "model": str(best), "imgsz": imgsz, **val_hp}
                 cli_val = " ".join([to_cli_kv(k, v) for k, v in merged_val.items()])
                 cmd_val = f"yolo {task} val {cli_val}"
                 run_cmd(cmd_val)
 
                 # === val on test split ===
-                merged_test = {"data": str(data_yaml), "model": str(best), **test_hp}
+                merged_test = {"data": str(data_yaml), "model": str(best), "imgsz": imgsz, **test_hp}
                 cli_test = " ".join([to_cli_kv(k, v) for k, v in merged_test.items()])
                 cmd_test = f"yolo {task} val {cli_test}"
                 run_cmd(cmd_test)
