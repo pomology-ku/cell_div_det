@@ -249,6 +249,19 @@ def main():
     gt.add_argument("--gt-alpha", type=int, default=0, help="GT fill alpha 0..255 (0=no fill)")
     gt.add_argument("--gt-strip-prefix", type=str, default=r"^[0-9]+_", help="Regex to strip from the beginning of GT filenames (stem). Default: '^[0-9]+_'")
 
+    # Grid params (when --place-mode grid)
+    p.add_argument("--grid-overlap-x", type=float, default=0.0,
+                help="Horizontal overlap ratio [0..0.9] used in grid mode (0=no overlap)")
+    p.add_argument("--grid-overlap-y", type=float, default=0.0,
+                help="Vertical overlap ratio [0..0.9] used in grid mode (0=no overlap)")
+
+    # Cropping
+    c = ap.add_argument_group("Cropping")
+    c.add_argument("--crop", choices=["none", "tiles"], default="none",
+                help="Auto-crop output. 'tiles' crops to union of pasted tiles.")
+    c.add_argument("--crop-margin", type=int, default=0,
+                help="Extra margin (px) around crop box after scaling")
+
     args = ap.parse_args()
 
     xml_path = Path(args.xml)
@@ -290,11 +303,24 @@ def main():
         tlx = (sx - vw / 2.0) * px_per_u_x
         tly = (cy - vh / 2.0) * px_per_u_y
         return tlx, tly
+    
+    # --- grid mode precompute ---
+    min_idx_x = min(t["idx_x"] for t in tiles)
+    min_idx_y = min(t["idx_y"] for t in tiles)
+    # 代表タイルの大きさ（行列で異なる場合は平均でもOK）
+    tile_w_ref = sum(t["w"] for t in tiles) / max(1, len(tiles))
+    tile_h_ref = sum(t["h"] for t in tiles) / max(1, len(tiles))
+    stride_x = tile_w_ref * max(0.1, 1.0 - max(0.0, min(0.9, args.grid_overlap_x)))
+    stride_y = tile_h_ref * max(0.1, 1.0 - max(0.0, min(0.9, args.grid_overlap_y)))
+
 
     for t in tiles:
-        if args.place_mode == "offset":
-            x = t["offx"]
-            y = t["offy"]
+        if args.place_mode == "grid":
+            # 左上を最小の Index を原点にして等間隔配置
+            x = (t["idx_x"] - min_idx_x) * stride_x
+            y = (t["idx_y"] - min_idx_y) * stride_y
+        elif args.place_mode == "offset":
+            x = t["offx"]; y = t["offy"]
         elif args.place_mode == "stage":
             st = stage_to_px(t)
             if st is None:
@@ -309,6 +335,7 @@ def main():
                 sx, sy = st
                 x = sx + t["offx"]
                 y = sy + t["offy"]
+
         positions.append((t, x, y))
         min_x = min(min_x, x)
         min_y = min(min_y, y)
@@ -500,6 +527,32 @@ def main():
 
             print(f"[INFO] GT overlay: tiles matched {gt_found_tiles}, tiles without GT {gt_missing_tiles}, "
                 f"GT files used {total_gt_files_used}")
+
+    # ---------------- Auto-crop (optional) ----------------
+    if args.crop == "tiles":
+        # タイル矩形の union をスケール後座標系で計算
+        min_x_s = 1e18; min_y_s = 1e18; max_x_s = -1e18; max_y_s = -1e18
+        for t, x, y in positions:
+            x0 = int(round((x + shift_x) * scale))
+            y0 = int(round((y + shift_y) * scale))
+            x1 = int(round((x + shift_x + t["w"]) * scale))
+            y1 = int(round((y + shift_y + t["h"]) * scale))
+            min_x_s = min(min_x_s, x0)
+            min_y_s = min(min_y_s, y0)
+            max_x_s = max(max_x_s, x1)
+            max_y_s = max(max_y_s, y1)
+
+        # マージン付与＆クリップ
+        mg = max(0, int(args.crop_margin))
+        x0c = max(0, min_x_s - mg)
+        y0c = max(0, min_y_s - mg)
+        x1c = min(out_scaled.width,  max_x_s + mg)
+        y1c = min(out_scaled.height, max_y_s + mg)
+
+        if x1c > x0c and y1c > y0c:
+            out_cropped = out_scaled.crop((x0c, y0c, x1c, y1c))
+            out_scaled = out_cropped
+            print(f"[INFO] Cropped to tiles: ({x0c},{y0c})-({x1c},{y1c}) size={x1c-x0c}x{y1c-y0c}")
 
     # Save
     out_scaled.save(out_path)
