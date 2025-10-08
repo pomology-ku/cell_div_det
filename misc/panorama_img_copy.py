@@ -9,6 +9,7 @@ Features:
 - Only search in the given source directory (no subdir search)
 - Dry-run / verbose / move / force
 - Optional renaming: "<ID>_<basename>" (default) or keep original name
+- Optional normalization toggle for XML ImagePath matching
 """
 
 import argparse
@@ -36,6 +37,9 @@ def parse_args():
                    help="Overwrite if a file with the same name exists in outdir")
     p.add_argument("-e", "--ext-fallback", default="",
                    help="If image not found, try these extensions (comma-separated, e.g. 'tif,jpg,png')")
+    p.add_argument("--no-normalize", dest="do_normalize", action="store_false",
+                   help="Do NOT normalize XML ImagePath before matching")
+    p.set_defaults(do_normalize=True)
     return p.parse_args()
 
 def read_id_list(path):
@@ -71,18 +75,18 @@ def normalize_filename(name: str) -> str:
     """
     Normalize XML ImagePath for matching:
     - Strip leading/trailing spaces
-    - Remove leading numeric prefixes (e.g., '00002 ' → '')
+    - Remove leading numeric prefixes (e.g., '00002 ' -> '')
     """
     name = name.strip()
-    # 先頭の数字+スペースを削除
     parts = name.split(maxsplit=1)
     if parts and parts[0].isdigit() and len(parts) > 1:
         return parts[1]
     return name
 
-def find_image(src_dir: Path, image_path: str, ext_candidates: list[str]) -> Path | None:
-    # 正規化
-    image_path = normalize_filename(image_path)
+def find_image(src_dir: Path, image_path: str, ext_candidates: list[str], do_normalize: bool) -> Path | None:
+    # 正規化オプション
+    if do_normalize:
+        image_path = normalize_filename(image_path)
 
     rel = Path(image_path)
     cand = src_dir / rel.name
@@ -98,8 +102,9 @@ def find_image(src_dir: Path, image_path: str, ext_candidates: list[str]) -> Pat
     # 拡張子fallback
     stem = rel.stem
     if ext_candidates:
+        extset = {e.lower() for e in ext_candidates}
         for p in files:
-            if p.stem == stem and p.suffix.lstrip(".").lower() in [e.lower() for e in ext_candidates]:
+            if p.stem == stem and p.suffix.lstrip(".").lower() in extset:
                 return p
 
     return None
@@ -143,6 +148,7 @@ def main():
     if args.verbose:
         print(f"[INFO] IDs to process: {len(ids)}")
         print(f"[INFO] XML entries: {len(mapping)}")
+        print(f"[INFO] Normalize ImagePath: {args.do_normalize}")
 
     missing_in_xml = []
     not_found_on_disk = []
@@ -156,7 +162,7 @@ def main():
                 print(f"[WARN] ID {kid}: not found in XML")
             continue
 
-        src_path = find_image(src_dir, img_path, ext_fallbacks)
+        src_path = find_image(src_dir, img_path, ext_fallbacks, args.do_normalize)
         if src_path is None:
             not_found_on_disk.append((kid, img_path))
             if args.verbose:
@@ -164,10 +170,7 @@ def main():
             continue
 
         basename = src_path.name
-        if args.keep_name:
-            out_name = basename
-        else:
-            out_name = f"{kid}_{basename}"
+        out_name = basename if args.keep_name else f"{kid}_{basename}"
 
         dst_path = outdir / out_name
         try:
