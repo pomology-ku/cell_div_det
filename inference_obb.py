@@ -36,6 +36,9 @@ import torch
 from tqdm import tqdm
 from ultralytics import YOLO
 
+import cv2
+from tta_obb import predict_obb_with_tta
+
 IMG_EXT = ".tif"
 
 # ---------- 幾何ユーティリティ ----------
@@ -176,6 +179,12 @@ def main():
     ap.add_argument("-g", "--device", default=None, help="Device (e.g., cuda:0). Default auto")
     ap.add_argument("--half", action="store_true", help="Use fp16 on CUDA")
     ap.add_argument("--min-area", type=float, default=1.0, help="Minimum polygon area in pixels to keep")
+    ap.add_argument("--tta", default="none", choices=["none","flips","rot90","all"],
+                help="flip/rotate test-time augmentation")
+    ap.add_argument("--tta-merge-iou", type=float, default=0.50,
+                    help="rotated-NMS IoU for merging TTA views")
+    ap.add_argument("--nms-iou", type=float, default=0.70,
+                    help="per-call NMS IoU passed to Ultralytics model.predict")
     args = ap.parse_args()
 
     # どちらも指定なしはエラー
@@ -232,8 +241,12 @@ def main():
     # 推論ループ
     for img_id, p in enumerate(tqdm(img_paths, total=len(img_paths)), start=1):
         # 画像サイズ
-        with Image.open(p) as im:
-            W, H = im.size
+        img_np = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        if img_np is None:
+            raise RuntimeError(f"Failed to read image: {p}")
+        if img_np.ndim == 2:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+        H, W = img_np.shape[:2] 
 
         # (A) COCO: images[]
         if coco is not None:
@@ -254,70 +267,35 @@ def main():
             if args.save_images_mode != "none":
                 link_or_copy(p, dst_img, args.save_images_mode)
 
-        # 推論
-        res = model.predict(
-            source=str(p),
-            stream=False,
-            verbose=False,
+        # TTA推論（複数ビュー→逆変換→集約→回転NMS）
+        polys_np, pred_classes, pred_confs, xywhr_merged = predict_obb_with_tta(
+            model=model,
+            img_bgr=img_np,
             conf=args.conf,
+            iou=args.nms_iou,          # ← Ultralytics側のNMS IoU
             imgsz=args.imgsz,
-            device=args.device,
-            half=args.half,
-            workers=0
-        )[0]
+            tta_mode=args.tta,
+            tta_merge_iou=args.tta_merge_iou  # ← TTAビュー統合用の回転NMS IoU
+        )
 
-        # 1画像分: 検出を収集
-        polys = []      # [(poly(list[8]), cls(int))]
-        obb_params = [] # [(xc,yc,w,h,a,cls)]  ※画素座標・ラジアン
+        # 1画像分: 出力用の構造に詰め替え
+        polys = []       # [(poly(list[8]), cls(int))]
+        obb_params = []  # [(xc,yc,w,h,a(rad),cls)]
 
-        # OBB -> polygon/xywhr
-        if getattr(res, "obb", None) is not None:
-            obb = res.obb
-            # 直接 xyxyxyxy
-            if getattr(obb, "xyxyxyxy", None) is not None:
-                arr = obb.xyxyxyxy.cpu().numpy()  # (N,8)
-                cl  = obb.cls.cpu().numpy().astype(int) if getattr(obb, "cls", None) is not None else \
-                      res.boxes.cls.cpu().numpy().astype(int)
-                for i in range(arr.shape[0]):
-                    poly_pix = [float(x) for x in arr[i].reshape(-1).tolist()]
-                    # 角度パラメータも推定
-                    try:
-                        xc, yc, ww, hh, a = poly4_to_xyrwha(poly_pix)
-                    except Exception:
-                        # フォールバック: AABB 角度0
-                        bbox = poly_to_bbox(poly_pix)
-                        xc = bbox[0] + bbox[2]/2
-                        yc = bbox[1] + bbox[3]/2
-                        ww, hh, a = bbox[2], bbox[3], 0.0
-                    obb_params.append((xc, yc, ww, hh, a, int(cl[i])))
-                    polys.append((poly_pix, int(cl[i])))
+        for (poly_np, cls_idx, score, xywhr) in zip(polys_np, pred_classes, pred_confs, xywhr_merged):
+            # polygon（画素座標; 8値）をCOCO用に
+            poly_pix = poly_np.reshape(-1).astype(float).tolist()
+            polys.append((poly_pix, int(cls_idx)))
 
-            # (xc,yc,w,h,rad)
-            elif getattr(obb, "xywhr", None) is not None:
-                xywhr = obb.xywhr.cpu().numpy()  # (N,5)
-                cl    = obb.cls.cpu().numpy().astype(int) if getattr(obb, "cls", None) is not None else \
-                        res.boxes.cls.cpu().numpy().astype(int)
-                for i in range(xywhr.shape[0]):
-                    xc, yc, ww, hh, a = [float(t) for t in xywhr[i].tolist()]
-                    # 角度正規化（w/h入替の可能性あり）
-                    a, ww, hh = _normalize_angle_wh(a, ww, hh)
-                    obb_params.append((xc, yc, ww, hh, a, int(cl[i])))
-                    poly_pix = xyrwha_to_poly(xc, yc, ww, hh, a)
-                    polys.append((poly_pix, int(cl[i])))
-
-        # Fallback: AABB (res.boxes.xyxy)
-        if getattr(res, "boxes", None) is not None and getattr(res.boxes, "xyxy", None) is not None:
-            xyxy = res.boxes.xyxy.cpu().numpy()
-            cl   = res.boxes.cls.cpu().numpy().astype(int)
-            for i in range(xyxy.shape[0]):
-                x1, y1, x2, y2 = [float(t) for t in xyxy[i].tolist()]
-                poly_pix = [x1, y1, x2, y1, x2, y2, x1, y2]
-                # AABBを OBB として angle=0 で記録
-                xc, yc = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                ww, hh = max(0.0, x2 - x1), max(0.0, y2 - y1)
-                a = 0.0
-                obb_params.append((xc, yc, ww, hh, a, int(cl[i])))
-                polys.append((poly_pix, int(cl[i])))
+            # xywhr_merged は (cx,cy,w,h,deg)。YOLO-OBBはラジアンで書く
+            cx, cy, ww, hh, a_deg = xywhr
+            a_rad = np.deg2rad(a_deg)
+            # 軽く (-pi/2, pi/2] に畳み込み（eval側と規約一致）
+            if a_rad <= -np.pi/2:
+                a_rad += np.pi
+            elif a_rad > np.pi/2:
+                a_rad -= np.pi
+            obb_params.append((float(cx), float(cy), float(ww), float(hh), float(a_rad), int(cls_idx)))
 
         # (A) COCO JSON: annotations 追加（AABB bbox）
         if coco is not None:
@@ -363,7 +341,6 @@ def main():
                 lbl_path.touch(exist_ok=True)
 
         # 後処理
-        del res
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
