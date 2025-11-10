@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Overlay GT and inference OBBs on images and save, with optional TTA (flip/rotate) and rotated-NMS merge.
+Refactored to import TTA/NMS utilities from tta_obb.py
 """
 import argparse
 from pathlib import Path
@@ -11,12 +12,15 @@ import numpy as np
 import json
 import csv
 import shutil
-from glob import glob
 from typing import List, Tuple, Dict, Optional
 
-import torch
-from torchvision.ops import nms as tv_nms
 from ultralytics import YOLO
+
+from tta_obb import (
+    predict_obb_with_tta,  # (model, img_bgr, conf, iou, imgsz, tta_mode, tta_merge_iou) -> (polys, classes, confs, [xywhr])
+    obb_to_polygon,
+    poly_iou,
+)
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -74,41 +78,25 @@ def map_image_to_label(img_path: Path) -> Path | None:
     cand2 = img_path.with_suffix(".txt")
     return cand2 if cand2.exists() else None
 
-# ---------------------- Geometry ----------------------
+# ---------------------- AABB helpers (for optional AABB IoU eval) ----------------------
 
-def normalize_angle_deg(a: float) -> float:
-    # normalize to (-90, 90]
-    while a <= -90.0:
-        a += 180.0
-    while a > 90.0:
-        a -= 180.0
-    return a
+def poly_to_aabb(poly: np.ndarray) -> tuple[float,float,float,float]:
+    x1, y1 = np.min(poly, axis=0)
+    x2, y2 = np.max(poly, axis=0)
+    return float(x1), float(y1), float(x2), float(y2)
 
-def obb_to_polygon(cx, cy, w, h, angle_deg):
-    theta = np.deg2rad(angle_deg)
-    c, s = np.cos(theta), np.sin(theta)
-    hw, hh = w / 2.0, h / 2.0
-    rect = np.array([[-hw, -hh],
-                     [ hw, -hh],
-                     [ hw,  hh],
-                     [-hw,  hh]], dtype=np.float32)
-    R = np.array([[c, -s],
-                  [s,  c]], dtype=np.float32)
-    pts = rect @ R.T
-    pts[:, 0] += cx
-    pts[:, 1] += cy
-    return pts
+def iou_aabb(b1, b2) -> float:
+    x1 = max(b1[0], b2[0]); y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2]); y2 = min(b1[3], b2[3])
+    iw = max(0.0, x2 - x1); ih = max(0.0, y2 - y1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    a1 = max(0.0, (b1[2]-b1[0])) * max(0.0, (b1[3]-b1[1]))
+    a2 = max(0.0, (b2[2]-b2[0])) * max(0.0, (b2[3]-b2[1]))
+    return float(inter / max(a1 + a2 - inter, 1e-9))
 
-def _signed_area(poly: np.ndarray) -> float:
-    # poly: (N,2)
-    x = poly[:,0]; y = poly[:,1]
-    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-
-def _ensure_ccw(poly: np.ndarray) -> np.ndarray:
-    # OpenCVの intersectConvexConvex は CCW が安定
-    if _signed_area(poly) < 0:
-        return poly[::-1].copy()
-    return poly
+# ---------------------- Metrics core ----------------------
 
 def _compute_ap(rec, prec):
     """COCO風：precisionのエンベロープ化→面積（数値積分）。"""
@@ -121,7 +109,6 @@ def _compute_ap(rec, prec):
     i = np.where(mrec[1:] != mrec[:-1])[0]
     ap = float(np.sum((mrec[i + 1] - mrec[i]) * mprec[i + 1]))
     return ap
-
 
 def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float], iou_mode: str = "obb"):
     """
@@ -195,7 +182,7 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
                 for j, g in enumerate(gts):
                     if g['matched']:
                         continue
-                    iou = _iou(ppoly, g['poly'])  # ← ここだけ差し替え
+                    iou = _iou(ppoly, g['poly'])
                     if iou > iou_max:
                         iou_max = iou; jmax = j
                 if iou_max >= thr and jmax >= 0:
@@ -233,106 +220,7 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
         "num_classes": len(cls_ids),
     }
 
-def poly_iou(poly1: np.ndarray, poly2: np.ndarray) -> float:
-    """凸四角形どうしのIoU（点順序をCCWに正規化してから intersectConvexConvex）。"""
-    p1 = _ensure_ccw(poly1.astype(np.float32))
-    p2 = _ensure_ccw(poly2.astype(np.float32))
-
-    a1 = abs(cv2.contourArea(p1))
-    a2 = abs(cv2.contourArea(p2))
-    if a1 <= 0.0 or a2 <= 0.0:
-        return 0.0
-
-    inter, _ = cv2.intersectConvexConvex(p1, p2)
-    if inter <= 0.0:
-        return 0.0
-    return float(inter / max(a1 + a2 - inter, 1e-9))
-
-def poly_to_aabb(poly: np.ndarray) -> tuple[float,float,float,float]:
-    x1, y1 = np.min(poly, axis=0)
-    x2, y2 = np.max(poly, axis=0)
-    return float(x1), float(y1), float(x2), float(y2)
-
-def iou_aabb(b1, b2) -> float:
-    x1 = max(b1[0], b2[0]); y1 = max(b1[1], b2[1])
-    x2 = min(b1[2], b2[2]); y2 = min(b1[3], b2[3])
-    iw = max(0.0, x2 - x1); ih = max(0.0, y2 - y1)
-    inter = iw * ih
-    if inter <= 0.0:
-        return 0.0
-    a1 = max(0.0, (b1[2]-b1[0])) * max(0.0, (b1[3]-b1[1]))
-    a2 = max(0.0, (b2[2]-b2[0])) * max(0.0, (b2[3]-b2[1]))
-    return float(inter / max(a1 + a2 - inter, 1e-9))
-
-def _xywhr_to_aabb(xywhr_list):
-    """(cx,cy,w,h,deg) -> (x1,y1,x2,y2) のAABBに変換（NMSの前処理用）。"""
-    aabbs = []
-    for (cx, cy, w, h, ang) in xywhr_list:
-        poly = obb_to_polygon(cx, cy, w, h, ang)
-        x1, y1 = np.min(poly, axis=0)
-        x2, y2 = np.max(poly, axis=0)
-        aabbs.append([x1, y1, x2, y2])
-    return torch.tensor(aabbs, dtype=torch.float32)
-
-
-def merge_rotated_nms_fallback(xywhr_list, confs, classes, iou_thr=0.5, per_class=True,
-                               aabb_stage=True, aabb_iou=0.9,
-                               center_k=0.5, area_tol=0.40, ang_tol=20.0):
-    """
-    二段NMS：
-      1) 省略可の粗NMS（AABB）：aabb_iou を高めてリコール重視（既定0.9）
-      2) 回転IoUベースの貪欲NMS。ただし抑制条件を拡張：
-         equiv_iou>=iou_thr  または near_orthogonal_gate を満たせば同一物体として抑制。
-    """
-    n = len(xywhr_list)
-    if n == 0:
-        return [], [], []
-
-    # --- 事前に「幅>=高さ」へ正規化（直交別解を一意化）
-    xywhr_norm = []
-    for (cx, cy, w, h, a) in xywhr_list:
-        cx, cy, w, h, a = canonicalize_xywhr(cx, cy, w, h, a)
-        xywhr_norm.append((cx, cy, w, h, a))
-    xywhr_list = xywhr_norm
-
-    keep = list(range(n))
-    if aabb_stage:
-        # --- 粗選別: AABBで標準nms（ただしリコール最優先で緩く：高IoU閾値）
-        boxes_aabb = _xywhr_to_aabb(xywhr_list)
-        scores = torch.tensor(confs, dtype=torch.float32)
-        keep_idx = tv_nms(boxes_aabb, scores, aabb_iou)
-        keep = keep_idx.cpu().numpy().tolist()
-
-    xywhr = [xywhr_list[i] for i in keep]
-    confs_k = [confs[i] for i in keep]
-    cls_k   = [classes[i] for i in keep]
-
-    # --- 仕上げ: 回転IoUの貪欲NMS（equiv_iou∨幾何ゲートで抑制）
-    order = np.argsort(-np.asarray(confs_k))
-    used = np.zeros(len(order), dtype=bool)
-    final = []
-
-    for oi in order:
-        if used[oi]:
-            continue
-        final.append(oi)
-        used[oi] = True
-        bi = xywhr[oi]
-        for oj in order:
-            if used[oj]:
-                continue
-            if per_class and (cls_k[oi] != cls_k[oj]):
-                continue
-            bj = xywhr[oj]
-
-            # 抑制条件：equiv_iou>=iou_thr or near_orthogonal_gate
-            if (equiv_iou(bi, bj) >= iou_thr) or near_orthogonal_gate(bi, bj, center_k, area_tol, ang_tol):
-                used[oj] = True
-
-    out_boxes  = [xywhr[i] for i in final]
-    out_scores = [confs_k[i] for i in final]
-    out_cls    = [cls_k[i]   for i in final]
-    return out_boxes, out_scores, out_cls
+# ---------------------- GT loader & drawing ----------------------
 
 def load_gt_polys_auto(lbl_path: Path, img_w: int, img_h: int) -> list[tuple[np.ndarray, int]]:
     polys: list[tuple[np.ndarray, int]] = []
@@ -355,6 +243,7 @@ def load_gt_polys_auto(lbl_path: Path, img_w: int, img_h: int) -> list[tuple[np.
             else:
                 nums = toks
 
+            # YOLO OBB (cls cx cy w h ang[rad or deg])
             if 6 <= len(nums) < 9:
                 try:
                     cls = int(float(nums[0]))
@@ -368,6 +257,7 @@ def load_gt_polys_auto(lbl_path: Path, img_w: int, img_h: int) -> list[tuple[np.
                 polys.append((poly, cls))
                 continue
 
+            # Polygon (cls x1 y1 x2 y2 x3 y3 x4 y4) possibly in [0,1] or abs
             if len(nums) >= 9:
                 try:
                     cls = int(float(nums[0]))
@@ -395,232 +285,7 @@ def draw_poly(img: np.ndarray, poly: np.ndarray, color: Tuple[int,int,int], thic
         p0 = tuple(pts[0, 0].tolist())
         cv2.putText(img, label, p0, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
-# ---------------------- TTA transforms ----------------------
-
-class TTATransform:
-    """Defines a forward transform on image and the inverse mapping for OBB (cx,cy,w,h,deg)."""
-    def __init__(self, name: str): self.name = name
-
-    def apply_img(self, img: np.ndarray) -> np.ndarray:
-        h, w = img.shape[:2]
-        if self.name == "identity":
-            return img
-        if self.name == "hflip":
-            return cv2.flip(img, 1)
-        if self.name == "vflip":
-            return cv2.flip(img, 0)
-        if self.name == "rot90":
-            return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        if self.name == "rot180":
-            return cv2.rotate(img, cv2.ROTATE_180)
-        if self.name == "rot270":
-            return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        raise ValueError(self.name)
-
-    def invert_box(self, cx, cy, w, h, ang_deg, orig_w, orig_h):
-        """Map a box predicted on the TRANSFORMED image back to ORIGINAL image coords."""
-        if self.name == "identity":
-            pass
-        elif self.name == "hflip":
-            cx = orig_w - cx
-            ang_deg = normalize_angle_deg(180.0 - ang_deg)
-        elif self.name == "vflip":
-            cy = orig_h - cy
-            ang_deg = normalize_angle_deg(-ang_deg)
-        elif self.name == "rot90":
-            # forward: (x,y) -> (y, W-x); back = rotate +90 clockwise
-            x_p, y_p = cx, cy
-            cx, cy = orig_w - y_p, x_p
-            w, h = h, w
-            ang_deg = normalize_angle_deg(ang_deg - 90.0)
-        elif self.name == "rot180":
-            cx = orig_w - cx
-            cy = orig_h - cy
-            ang_deg = normalize_angle_deg(ang_deg - 180.0)
-        elif self.name == "rot270":
-            # forward: (x,y) -> (H-y, x); back = rotate +90 counter-clockwise
-            x_p, y_p = cx, cy
-            cx, cy = y_p, orig_h - x_p
-            w, h = h, w
-            ang_deg = normalize_angle_deg(ang_deg + 90.0)
-        return cx, cy, w, h, ang_deg
-    
-def canonicalize_xywhr(cx, cy, w, h, ang_deg):
-    # 幅≧高さ の規約に統一。w<hならw/hを入れ替えつつ角度+90°。
-    if w < h:
-        w, h = h, w
-        ang_deg = normalize_angle_deg(ang_deg + 90.0)
-    # 角度は(-90,90]で正規化
-    ang_deg = normalize_angle_deg(ang_deg)
-    return float(cx), float(cy), float(w), float(h), float(ang_deg)
-
-def alt_rotate_xywhr(b):
-    cx, cy, w, h, a = b
-    return (cx, cy, h, w, normalize_angle_deg(a + 90.0))
-
-def equiv_iou(bi, bj):
-    # そのままIoU と 片方90°別解 のIoU の最大
-    Pi = obb_to_polygon(*bi)
-    Pj = obb_to_polygon(*bj)
-    i0 = poly_iou(Pi, Pj)
-    Pj_alt = obb_to_polygon(*alt_rotate_xywhr(bj))
-    i1 = poly_iou(Pi, Pj_alt)
-    Pi_alt = obb_to_polygon(*alt_rotate_xywhr(bi))
-    i2 = poly_iou(Pi_alt, Pj)
-    return max(i0, i1, i2)
-
-def near_orthogonal_gate(bi, bj,
-                         center_k=0.5,    # 中心距離許容（サイズ依存、0.5～0.8で調整）
-                         area_tol=0.40,   # 面積相対差（0.30～0.50）
-                         ang_tol=20.0):   # 90°近傍の許容
-    (cxi, cyi, wi, hi, ai) = bi
-    (cxj, cyj, wj, hj, aj) = bj
-
-    # 中心距離をサイズで正規化（幾何平均サイズで割る）
-    si = max(1e-6, np.sqrt(wi * hi))
-    sj = max(1e-6, np.sqrt(wj * hj))
-    s  = 0.5 * (si + sj)
-    d  = np.hypot(cxi - cxj, cyi - cyj) / s
-    if d > center_k:
-        return False
-
-    # 面積が近いか
-    ai_area = wi * hi
-    aj_area = wj * hj
-    if ai_area <= 0 or aj_area <= 0:
-        return False
-    rel = abs(ai_area - aj_area) / max(ai_area, aj_area)
-    if rel > area_tol:
-        return False
-
-    # 角度差が 90° ± ang_tol に近いか
-    dang = abs((ai - aj + 180.0) % 180.0 - 90.0)
-    if dang > ang_tol:
-        return False
-
-    return True
-
-def get_tta_list(mode: str) -> List[TTATransform]:
-    if mode == "none":
-        return [TTATransform("identity")]
-    if mode == "flips":
-        return [TTATransform(n) for n in ["identity", "hflip", "vflip"]]
-    if mode == "rot90":
-        return [TTATransform(n) for n in ["identity", "rot90", "rot180", "rot270"]]
-    if mode == "all":
-        # 十分な多様性＆重複少なめ
-        return [TTATransform(n) for n in ["identity", "hflip", "vflip", "rot90", "rot270"]]
-    raise ValueError(f"Unknown TTA mode: {mode}")
-
-# ---------------------- NMS merge (rotated) ----------------------
-
-def merge_rotated_nms(xywhr_list, confs, classes, iou_thr=0.5):
-    """
-    ABBで標準nms→回転IoUで仕上げを使う。
-    """
-    return merge_rotated_nms_fallback(xywhr_list, confs, classes, iou_thr=iou_thr, per_class=True)
-
-
-# ---------------------- Prediction with TTA ----------------------
-
-def predict_obb_with_tta(model: YOLO, img_bgr: np.ndarray, conf: float, iou: float,
-                         imgsz: Optional[int], tta_mode: str, tta_merge_iou: float):
-    """
-    Run multiple predictions with flip/rotate TTA, map back to original coords, and merge by rotated-NMS.
-    Returns: list of polys (4x2), classes, confs
-    """
-    H0, W0 = img_bgr.shape[:2]
-    tta_list = get_tta_list(tta_mode)
-    xywhr_all, cls_all, conf_all = [], [], []
-
-    for t in tta_list:
-        img_t = t.apply_img(img_bgr)
-        # Ultralytics can take np.ndarray directly
-        res = model.predict(source=img_t, conf=conf, iou=iou, imgsz=imgsz, verbose=False)[0]
-
-        # Prefer OBB
-        if getattr(res, "obb", None) is not None and res.obb is not None and res.obb.xywhr is not None:
-            xywhr = res.obb.xywhr.cpu().numpy()  # (N,5): cx,cy,w,h,angle(rad)
-
-            # ★ クラスは obb.cls を最優先、無ければ boxes.cls を見る
-            if getattr(res.obb, "cls", None) is not None:
-                cls_arr = res.obb.cls.cpu().numpy().astype(int)
-            elif getattr(res, "boxes", None) is not None and getattr(res.boxes, "cls", None) is not None:
-                cls_arr = res.boxes.cls.cpu().numpy().astype(int)
-            else:
-                cls_arr = np.full(len(xywhr), -1, dtype=int)
-
-            # ★ スコアは obb.conf を最優先、無ければ boxes.conf
-            if getattr(res.obb, "conf", None) is not None:
-                conf_arr = res.obb.conf.cpu().numpy().astype(float)
-            elif getattr(res, "boxes", None) is not None and getattr(res.boxes, "conf", None) is not None:
-                conf_arr = res.boxes.conf.cpu().numpy().astype(float)
-            else:
-                conf_arr = np.zeros(len(xywhr), dtype=float)
-
-            # 長さを安全に揃える（まれに不一致が起きる対策）
-            n = len(xywhr)
-            if len(cls_arr) != n:
-                if len(cls_arr) < n:
-                    cls_pad = np.full(n - len(cls_arr), -1, dtype=int)
-                    cls_arr = np.concatenate([cls_arr, cls_pad], axis=0)
-                else:
-                    cls_arr = cls_arr[:n]
-            if len(conf_arr) != n:
-                if len(conf_arr) < n:
-                    conf_pad = np.zeros(n - len(conf_arr), dtype=float)
-                    conf_arr = np.concatenate([conf_arr, conf_pad], axis=0)
-                else:
-                    conf_arr = conf_arr[:n]
-
-            for k in range(n):
-                cx, cy, ww, hh, ang = xywhr[k]
-                ang_deg = np.degrees(ang) if abs(ang) <= 3.2 else ang
-                cx2, cy2, w2, h2, a2 = t.invert_box(cx, cy, ww, hh, ang_deg, W0, H0)
-                a2 = normalize_angle_deg(a2)
-                cx2, cy2, w2, h2, a2 = canonicalize_xywhr(cx2, cy2, w2, h2, a2)
-                if w2 <= 0 or h2 <= 0:
-                    w2 = max(w2, 1e-3)
-                    h2 = max(h2, 1e-3)
-                xywhr_all.append((float(cx2), float(cy2), float(w2), float(h2), float(a2)))
-                cls_all.append(int(cls_arr[k]))
-                conf_all.append(float(conf_arr[k]))
-
-        else:
-            # Fallback: AABB -> OBB(angle=0)
-            if getattr(res, "boxes", None) is not None and res.boxes is not None and res.boxes.xyxy is not None:
-                xyxy = res.boxes.xyxy.cpu().numpy()
-                cls = res.boxes.cls.cpu().numpy().astype(int) if res.boxes.cls is not None else np.full(len(xyxy), -1)
-                confs = res.boxes.conf.cpu().numpy().tolist() if res.boxes.conf is not None else [0.0]*len(xyxy)
-                h_t, w_t = img_t.shape[:2]
-                for (x1, y1, x2, y2), c, s in zip(xyxy, cls, confs):
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    w, h = max(x2 - x1, 1e-3), max(y2 - y1, 1e-3)
-
-                    # AABBは回転0°で扱い、逆変換だけかける
-                    cx2, cy2, w2, h2, a2 = t.invert_box(cx, cy, w, h, 0.0, W0, H0)
-                    a2 = normalize_angle_deg(a2)
-
-                    # ★ 幅>=高さに正規化（直交ダブり防止）
-                    cx2, cy2, w2, h2, a2 = canonicalize_xywhr(cx2, cy2, w2, h2, a2)
-
-                    # 数値安定化
-                    if w2 <= 0 or h2 <= 0:
-                        w2 = max(w2, 1e-3)
-                        h2 = max(h2, 1e-3)
-
-                    xywhr_all.append((float(cx2), float(cy2), float(w2), float(h2), float(a2)))
-                    cls_all.append(int(c))
-                    conf_all.append(float(s))
-
-    # Merge by rotated-NMS
-    xywhr_merged, conf_merged, cls_merged = merge_rotated_nms(xywhr_all, conf_all, cls_all, iou_thr=tta_merge_iou)
-
-    # Convert to polygons for drawing
-    polys = [obb_to_polygon(cx, cy, w, h, ang) for (cx, cy, w, h, ang) in xywhr_merged]
-    return polys, cls_merged, conf_merged
-
-# ---------------------- Metrics collection ----------------------
+# ---------------------- Ultralytics metrics harvest ----------------------
 
 def try_collect_metrics_from_api(val_ret) -> Dict[str, float]:
     out = {}
@@ -733,6 +398,8 @@ def main():
     data_yaml = Path(args.data).resolve()
     cfg = load_yaml(data_yaml)
 
+    if args.cfg is None:
+        raise RuntimeError("--cfg is required to obtain train.imgsz")
     train_yaml = Path(args.cfg).resolve()
     train_cfg = load_yaml(train_yaml)
     try:
@@ -800,7 +467,7 @@ def main():
                     gt_items.append({"cls": int(cls), "poly": poly.astype(np.float32)})
 
             # Predictions with TTA merge
-            polys, pred_classes, pred_confs = predict_obb_with_tta(
+            polys, pred_classes, pred_confs, _xywhr = predict_obb_with_tta(
                 model=model, img_bgr=as_bgr(img), conf=args.conf, iou=args.iou,
                 imgsz=imgsz, tta_mode=args.tta, tta_merge_iou=args.tta_merge_iou
             )
@@ -829,7 +496,7 @@ def main():
 
             pred_items = []
             for poly, cls, conf in zip(polys, pred_classes, pred_confs):
-                if cls is None or cls < 0: 
+                if cls is None or cls < 0:
                     continue
                 pred_items.append({"cls": int(cls), "conf": float(conf), "poly": poly.astype(np.float32)})
 
@@ -838,6 +505,7 @@ def main():
                 "gt": gt_items,
                 "pred": pred_items,
             })
+
         print("\n[TTA EVAL] Computing TTA-based metrics (mAP@0.50 and mAP@0.50:0.95) ...")
         tta_metrics = eval_tta_detections(tta_records, class_names, iou_thrs=map_iou_thrs, iou_mode=args.eval_iou_mode)
 
