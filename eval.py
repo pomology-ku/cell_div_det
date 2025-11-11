@@ -110,14 +110,21 @@ def _compute_ap(rec, prec):
     ap = float(np.sum((mrec[i + 1] - mrec[i]) * mprec[i + 1]))
     return ap
 
-def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float], iou_mode: str = "obb"):
+def eval_tta_detections(
+    records,
+    class_names: dict | None,
+    iou_thrs: list[float],
+    iou_mode: str = "obb",
+    recall_iou: float = 0.50,
+    conf_thresh: float = 0.25,
+):
     """
-    records: list of dict per image:
-      { 'image_id': str,
-        'gt':   [{'cls':int, 'poly':np.ndarray(4,2)}, ...],
-        'pred': [{'cls':int, 'conf':float, 'poly':np.ndarray(4,2)}, ...] }
-    iou_thrs: [0.50,0.55,...] 等
-    iou_mode: "obb"=多角形IoU, "aabb"=軸平行IoU
+    Evaluate mAP and Recall at given IoU/conf thresholds.
+    records: [{'image_id':..., 'gt':[{'cls','poly'}], 'pred':[{'cls','conf','poly'}]}]
+    iou_thrs: e.g. [0.50,0.55,...,0.95]
+    iou_mode: 'obb' or 'aabb'
+    recall_iou: IoU threshold for recall counting (default=0.50)
+    conf_thresh: confidence threshold to count a detection as valid (default=0.25)
     """
     if iou_mode == "aabb":
         def _iou(p1, p2):
@@ -126,7 +133,7 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
         def _iou(p1, p2):
             return poly_iou(p1, p2)
 
-    # クラス一覧
+    # ---- クラス一覧 ----
     if class_names:
         cls_ids = sorted(class_names.keys())
     else:
@@ -136,8 +143,8 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
             for p in r['pred']: s.add(int(p['cls']))
         cls_ids = sorted(int(c) for c in s if c is not None and c >= 0)
 
-    # 画像ごとのGTをクラス単位に索引化
-    gt_by_img_cls = {}  # (img, cls) -> list of {'poly','matched':False}
+    # ---- GT索引 ----
+    gt_by_img_cls = {}
     npos_by_cls = {cid: 0 for cid in cls_ids}
     for r in records:
         img_id = r['image_id']
@@ -151,11 +158,11 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
         for cid, arr in gts.items():
             gt_by_img_cls[(img_id, cid)] = arr
 
-    # しきい値ごとにAP計算
-    aps_50 = {}
-    aps_range = {}
+    aps_50, aps_range = {}, {}
+    recall_hits_by_cls = {cid: 0 for cid in cls_ids}
+
+    # ---- 各クラスごとに評価 ----
     for cid in cls_ids:
-        # 予測を集約してconf降順
         preds = []
         for r in records:
             img_id = r['image_id']
@@ -165,11 +172,10 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
         preds.sort(key=lambda x: -x[1])
 
         ap_per_thr = []
+        # ===== mAP =====
         for thr in iou_thrs:
             tp = np.zeros(len(preds), dtype=np.float32)
             fp = np.zeros(len(preds), dtype=np.float32)
-
-            # GTのマッチ状態をリセット
             for key, arr in gt_by_img_cls.items():
                 if key[1] == cid:
                     for it in arr:
@@ -177,14 +183,13 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
 
             for i, (img_id, conf, ppoly) in enumerate(preds):
                 gts = gt_by_img_cls.get((img_id, cid), [])
-                iou_max = 0.0
-                jmax = -1
+                iou_max = 0.0; jmax = -1
                 for j, g in enumerate(gts):
                     if g['matched']:
                         continue
                     iou = _iou(ppoly, g['poly'])
                     if iou > iou_max:
-                        iou_max = iou; jmax = j
+                        iou_max, jmax = iou, j
                 if iou_max >= thr and jmax >= 0:
                     tp[i] = 1.0
                     gts[jmax]['matched'] = True
@@ -196,25 +201,55 @@ def eval_tta_detections(records, class_names: dict | None, iou_thrs: list[float]
             denom = np.maximum(cum_tp + cum_fp, 1e-12)
             prec = cum_tp / denom
             rec  = cum_tp / max(npos_by_cls[cid], 1e-12)
-
             ap = _compute_ap(rec, prec) if npos_by_cls[cid] > 0 else 0.0
             ap_per_thr.append(ap)
-
             if abs(thr - 0.50) < 1e-9:
                 aps_50[cid] = ap
-
         aps_range[cid] = float(np.mean(ap_per_thr)) if ap_per_thr else 0.0
 
+        # ===== Recall(conf ≥ conf_thresh & IoU ≥ recall_iou) =====
+        for key, arr in gt_by_img_cls.items():
+            if key[1] == cid:
+                for it in arr:
+                    it['matched'] = False
+        matched_cnt = 0
+        for img_id, conf, ppoly in preds:
+            if conf < conf_thresh:
+                continue  # 低信頼予測は除外
+            gts = gt_by_img_cls.get((img_id, cid), [])
+            iou_max, jmax = 0.0, -1
+            for j, g in enumerate(gts):
+                if g['matched']:
+                    continue
+                iou = _iou(ppoly, g['poly'])
+                if iou > iou_max:
+                    iou_max, jmax = iou, j
+            if iou_max >= recall_iou and jmax >= 0:
+                gts[jmax]['matched'] = True
+                matched_cnt += 1
+        recall_hits_by_cls[cid] = matched_cnt
+
+    # ---- 集計 ----
     mAP50 = float(np.mean(list(aps_50.values()))) if aps_50 else 0.0
     mAP50_95 = float(np.mean(list(aps_range.values()))) if aps_range else 0.0
+    total_pos = sum(npos_by_cls.values())
+    total_hits = sum(recall_hits_by_cls.values())
+    recall_overall = float(total_hits / max(total_pos, 1e-12)) if total_pos > 0 else 0.0
+
     per_class = {}
     for cid in cls_ids:
         name = class_names.get(cid, str(cid)) if class_names else str(cid)
-        per_class[name] = {"AP50": float(aps_50.get(cid, 0.0)),
-                           "AP50_95": float(aps_range.get(cid, 0.0))}
+        rc = float(recall_hits_by_cls[cid] / max(npos_by_cls[cid], 1e-12)) if npos_by_cls[cid] > 0 else 0.0
+        per_class[name] = {
+            "AP50": float(aps_50.get(cid, 0.0)),
+            "AP50_95": float(aps_range.get(cid, 0.0)),
+            f"Recall(conf>={conf_thresh})": rc,
+        }
+
     return {
         "mAP50": mAP50,
         "mAP50_95": mAP50_95,
+        f"recall_overall(conf>={conf_thresh})": recall_overall,
         "per_class": per_class,
         "num_images": len(records),
         "num_classes": len(cls_ids),
@@ -507,7 +542,7 @@ def main():
             })
 
         print("\n[TTA EVAL] Computing TTA-based metrics (mAP@0.50 and mAP@0.50:0.95) ...")
-        tta_metrics = eval_tta_detections(tta_records, class_names, iou_thrs=map_iou_thrs, iou_mode=args.eval_iou_mode)
+        tta_metrics = eval_tta_detections(tta_records, class_names, iou_thrs=map_iou_thrs, iou_mode=args.eval_iou_mode, conf_thresh=args.conf)
 
         # 保存
         tta_json = metrics_dir / "metrics_tta_summary.json"
@@ -523,9 +558,15 @@ def main():
             w.writerow(["mAP50_95", tta_metrics["mAP50_95"]])
             w.writerow(["num_images", tta_metrics["num_images"]])
             w.writerow(["num_classes", tta_metrics["num_classes"]])
+            for k in tta_metrics.keys():
+                if k.startswith("recall_overall"):
+                    w.writerow([k, tta_metrics[k]])
 
         print(f"[TTA EVAL] mAP50={tta_metrics['mAP50']:.4f}  mAP50_95={tta_metrics['mAP50_95']:.4f}")
         print(f"[TTA EVAL] Saved: {tta_json}")
+        for k in tta_metrics.keys():
+            if k.startswith("recall_overall"):
+                print(f"[TTA EVAL] {k}={tta_metrics[k]:.4f}")
 
     # ---------- Metrics via Ultralytics val ----------
     print("\n[VAL] Running Ultralytics validation to compute metrics (no TTA) ...")
