@@ -142,37 +142,116 @@ def save_label(path,items,P):
             n=np.clip(pts/P,0,1)
             f.write(str(cls)+' '+' '.join(f"{v:.6f}" for v in n.reshape(-1))+"\n")
 
-def process_one(img_path,rel,lbl_root,out_root,P,S,inner_margin,min_area,keep_neg,max_neg,force_ext,dry_run,clip_mode):
+def _owning_tile(cx, cy, W, H, P, S):
+    n_rows = max(1, math.ceil((H - P) / S) + 1)
+    n_cols = max(1, math.ceil((W - P) / S) + 1)
+    c = min(int(cx // S), n_cols - 1)
+    r = min(int(cy // S), n_rows - 1)
+    x0 = min(c * S, max(0, W - P))
+    y0 = min(r * S, max(0, H - P))
+    c = int(round(x0 / S)) if S > 0 else 0
+    r = int(round(y0 / S)) if S > 0 else 0
+    return r, c
+
+def _tile_rc_from_origin(x0, y0, S):
+    c = int(round(x0 / S)) if S > 0 else 0
+    r = int(round(y0 / S)) if S > 0 else 0
+    return r, c
+
+def _tile_origin(r, c, W, H, P, S):
+    x0 = min(c * S, max(0, W - P))
+    y0 = min(r * S, max(0, H - P))
+    return x0, y0
+
+def _owning_tile(cx, cy, W, H, P, S):
+    n_rows = max(1, math.ceil((H - P) / S) + 1)
+    n_cols = max(1, math.ceil((W - P) / S) + 1)
+    c = min(int(cx // S), n_cols - 1)
+    r = min(int(cy // S), n_rows - 1)
+    x0, y0 = _tile_origin(r, c, W, H, P, S)
+    return _tile_rc_from_origin(x0, y0, S)
+
+def _neighbor_tiles(r0, c0, W, H, P, S):
+    n_rows = max(1, math.ceil((H - P) / S) + 1)
+    n_cols = max(1, math.ceil((W - P) / S) + 1)
+    tiles = []
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            r = r0 + dr; c = c0 + dc
+            if 0 <= r < n_rows and 0 <= c < n_cols:
+                tiles.append((r, c))
+    return tiles
+
+def _best_tile_for_object(pts_abs, cx, cy, W, H, P, S, min_area, clip_mode, edge_fallback, allow_small):
+    r0, c0 = _owning_tile(cx, cy, W, H, P, S)
+    candidates = _neighbor_tiles(r0, c0, W, H, P, S)
+    best = None
+    best_area = -1.0
+    best_poly = None
+    for (r, c) in candidates:
+        x0, y0 = _tile_origin(r, c, W, H, P, S)
+        local = pts_abs.copy()
+        local[:, 0] -= x0
+        local[:, 1] -= y0
+        poly = clip_quad_inside_patch(local, P, mode=clip_mode, area_min_px=min_area)
+        if poly is None and edge_fallback:
+            poly = clip_quad_inside_patch(local, P, mode='clip', area_min_px=0.0)
+        if poly is None and allow_small:
+            poly = np.clip(local, 0, float(P))
+        if poly is None:
+            continue
+        area = _poly_area(poly / float(P)) * (P ** 2)
+        if (area >= min_area) or allow_small:
+            # owner tile preference on ties
+            score = (area, 1 if (r, c) == (r0, c0) else 0)
+            if score > (best_area, 1 if best and best[0:2] == (r0, c0) else 0):
+                best_area = area
+                best = (r, c)
+                best_poly = poly
+    return best, best_poly
+
+def process_one(img_path,rel,lbl_root,out_root,P,S,inner_margin,min_area,keep_neg,max_neg,force_ext,dry_run,clip_mode,edge_fallback,allow_small):
     lbl_path=lbl_root/rel.with_suffix('.txt')
     img=cv2.imdecode(np.fromfile(str(img_path),dtype=np.uint8),cv2.IMREAD_UNCHANGED)
     if img is None:return(0,0)
     H,W=img.shape[:2]
     if img.ndim==2:img=cv2.cvtColor(img,cv2.COLOR_GRAY2BGR)
     objs=read_label(lbl_path,W,H)
-    cent=[(c,p,*poly_centroid(p)) for c,p in objs]
-    pos=neg=0
+    if len(objs)==0 and not keep_neg:
+        return (0,0)
+
+    # Pre-assign each object to the best tile (owner + neighbors, max post-clip area)
+    assigned = {}
+    for cls, pts in objs:
+        cx, cy = poly_centroid(pts)
+        (r_best, c_best), poly = _best_tile_for_object(
+            pts_abs=pts, cx=cx, cy=cy, W=W, H=H, P=P, S=S,
+            min_area=min_area, clip_mode=clip_mode,
+            edge_fallback=edge_fallback, allow_small=allow_small)
+        if (r_best, c_best) not in assigned:
+            assigned[(r_best, c_best)] = []
+        assigned[(r_best, c_best)].append((cls, poly))
+
     n_rows=max(1,math.ceil((H-P)/S)+1)
     n_cols=max(1,math.ceil((W-P)/S)+1)
-    max_negs=math.ceil(max_neg*max(1,len(objs))) if keep_neg else 0
     ext=(force_ext or img_path.suffix[1:])
+    pos=neg=0
+
     for r in range(n_rows):
         y0=min(r*S,max(0,H-P));y1=y0+P
         for c in range(n_cols):
             x0=min(c*S,max(0,W-P));x1=x0+P
-            margin=int(inner_margin*P)
-            ix0,iy0,ix1,iy1=x0+margin,y0+margin,x1-margin,y1-margin
-            kept=[]
-            for cls,pts,cx,cy in cent:
-                if not(ix0<=cx<ix1 and iy0<=cy<iy1):continue
-                local=pts.copy();local[:,0]-=x0;local[:,1]-=y0
-                local=clip_quad_inside_patch(local,P,mode=clip_mode,area_min_px=min_area)
-                if local is None:continue
-                kept.append((cls,local))
             relname=f"{rel.as_posix()}__r{r}_c{c}"
             out_img=out_root/'images'/f"{relname}.{ext}"
             out_lbl=out_root/'labels'/f"{relname}.txt"
+            kept = []
+            if (r, c) in assigned:
+                for cls, poly in assigned[(r, c)]:
+                    if poly is None:
+                        continue
+                    kept.append((cls, poly))
             if not kept:
-                if keep_neg and neg<max_negs and not dry_run:
+                if keep_neg and neg < math.ceil(max_neg*max(1,len(objs))) and not dry_run:
                     out_img.parent.mkdir(parents=True,exist_ok=True);out_lbl.parent.mkdir(parents=True,exist_ok=True)
                     tile=img[y0:y1,x0:x1];cv2.imencode(f'.{ext}',tile)[1].tofile(str(out_img));open(out_lbl,'w').close()
                 neg+=1;continue
@@ -189,12 +268,14 @@ def main():
     ap.add_argument('-o','--out_dir',required=True)
     ap.add_argument('-p','--patch_size',type=int,default=1280)
     ap.add_argument('-s','--stride',type=int,default=384)
-    ap.add_argument('--inner_margin',type=float,default=0.1)
+    ap.add_argument('--inner_margin',type=float,default=0.1, help='(kept for compatibility; not used for assignment)')
     ap.add_argument('--min_area',type=float,default=16.)
     ap.add_argument('--keep_neg',action='store_true')
     ap.add_argument('--max_neg_ratio',type=float,default=1.)
     ap.add_argument('--ext',default=None)
     ap.add_argument('--clip_mode',choices=['slide','clip'],default='slide')
+    ap.add_argument('--edge_fallback',action='store_true',help='If slide fails, try hard clip')
+    ap.add_argument('--allow_small',action='store_true',help='Keep even if area < min_area (last-resort)')
     ap.add_argument('--dry_run',action='store_true')
     args=ap.parse_args()
     img_root, lbl_root, out_root = Path(args.img_dir), Path(args.label_dir), Path(args.out_dir)
@@ -203,7 +284,12 @@ def main():
     total_pos=total_neg=0
     for img_path in find_images(img_root):
         rel=img_path.relative_to(img_root).with_suffix('')
-        pos,neg=process_one(img_path,rel,lbl_root,out_root,args.patch_size,args.stride,args.inner_margin,args.min_area,args.keep_neg,args.max_neg_ratio,args.ext,args.dry_run,args.clip_mode)
+        pos,neg=process_one(
+            img_path=img_path,rel=rel,lbl_root=Path(args.label_dir),out_root=Path(args.out_dir),
+            P=args.patch_size,S=args.stride,inner_margin=args.inner_margin,
+            min_area=args.min_area,keep_neg=args.keep_neg,max_neg=args.max_neg_ratio,
+            force_ext=args.ext,dry_run=args.dry_run,clip_mode=args.clip_mode,
+            edge_fallback=args.edge_fallback,allow_small=args.allow_small)
         total_pos+=pos;total_neg+=neg
     print(f"[DONE] Pos={total_pos} Neg={total_neg}")
 
