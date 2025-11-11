@@ -81,30 +81,81 @@ def _move_pair_along_long_edge(P: np.ndarray, i: int, area_min: float = 1e-6):
         return False, P
     d = d / n
 
-    p = P[i].copy()
-    q = P[j].copy()
-    Ip = _feasible_t_interval_for_point(p, d)
-    Iq = _feasible_t_interval_for_point(q, d)
-    if Ip is None or Iq is None:
-        return False, P
+    def try_with_direction(d_vec: np.ndarray):
+        p = P[i].copy()
+        q = P[j].copy()
+        Ip = _feasible_t_interval_for_point(p, d_vec)
+        Iq = _feasible_t_interval_for_point(q, d_vec)
+        if Ip is None or Iq is None:
+            return None  # 不可
 
-    t_low = max(Ip[0], Iq[0])
-    t_high = min(Ip[1], Iq[1])
-    if t_low > t_high:
-        return False, P
+        t_low = max(Ip[0], Iq[0])
+        t_high = min(Ip[1], Iq[1])
+        if t_low > t_high:
+            return None  # 交差なし
 
-    cand = [t for t in _candidate_t_to_touch_boundary(p, d) if t_low - 1e-12 <= t <= t_high + 1e-12]
-    t = min(cand, key=abs) if cand else (t_low if abs(t_low) < abs(t_high) else t_high)
+        # --- 1) OOB軸を“正しい境界”に寄せるtを優先候補にする ---
+        def target_ts(qpt: np.ndarray):
+            ts = []
+            # x軸
+            if qpt[0] < 0 and d_vec[0] > 1e-12:
+                ts.append((0.0 - qpt[0]) / d_vec[0])   # x=0 に揃える
+            elif qpt[0] > 1 and d_vec[0] < -1e-12:
+                ts.append((1.0 - qpt[0]) / d_vec[0])  # x=1 に揃える
+            # y軸
+            if qpt[1] < 0 and d_vec[1] > 1e-12:
+                ts.append((0.0 - qpt[1]) / d_vec[1])  # y=0
+            elif qpt[1] > 1 and d_vec[1] < -1e-12:
+                ts.append((1.0 - qpt[1]) / d_vec[1])  # y=1
+            return ts
 
-    v = t * d
-    P2 = P.copy()
-    P2[i] += v
-    P2[j] += v
-    P2 = np.clip(P2, 0, 1)
+        pref = []
+        for t in (target_ts(p) + target_ts(q)):
+            if t_low - 1e-12 <= t <= t_high + 1e-12:
+                # t 適用後に本当に内側へ入るか軽く確認
+                pp = p + t * d_vec; qq = q + t * d_vec
+                if (pp[0] >= -1e-9 and pp[0] <= 1 + 1e-9 and
+                    pp[1] >= -1e-9 and pp[1] <= 1 + 1e-9 and
+                    qq[0] >= -1e-9 and qq[0] <= 1 + 1e-9 and
+                    qq[1] >= -1e-9 and qq[1] <= 1 + 1e-9):
+                    pref.append(t)
 
-    if _poly_area(P2) < area_min:
-        return False, P
-    return True, P2
+        # --- 2) 優先候補があれば、その中で |t| 最小を使う ---
+        if pref:
+            t = min(pref, key=lambda x: abs(x))
+        else:
+            # --- 3) 従来候補（境界ヒット全体）にフォールバック ---
+            cand = []
+            for qpt in (p, q):
+                cand.extend([t for t in _candidate_t_to_touch_boundary(qpt, d_vec)
+                             if t_low - 1e-12 <= t <= t_high + 1e-12])
+            if cand:
+                t = min(cand, key=lambda x: abs(x))
+            else:
+                # それでも無ければ区間端にフォールバック
+                t = t_low if abs(t_low) < abs(t_high) else t_high
+
+        v = t * d_vec
+        P2 = P.copy()
+        P2[i] += v
+        P2[j] += v
+        P2 = np.clip(P2, 0, 1)
+
+        if _poly_area(P2) < area_min:
+            return None
+        return P2
+
+    # まず元の方向で試す
+    P_try = try_with_direction(d)
+    if P_try is not None:
+        return True, P_try
+
+    # ダメなら逆方向でも試す（“押し込み方向”が逆の時の保険）
+    P_try = try_with_direction(-d)
+    if P_try is not None:
+        return True, P_try
+
+    return False, P
 
 def slide_clip_normalized(P01: np.ndarray, area_min01: float = 1e-6):
     """
@@ -167,18 +218,12 @@ def _tile_origin(r: int, c: int, W: int, H: int, P: int, S: int):
     y0 = min(r * S, max(0, H - P))
     return x0, y0
 
-def _tile_rc_from_origin(x0: int, y0: int, S: int):
-    c = int(round(x0 / S)) if S > 0 else 0
-    r = int(round(y0 / S)) if S > 0 else 0
-    return r, c
-
 def _owning_tile(cx: float, cy: float, W: int, H: int, P: int, S: int):
     n_rows = max(1, math.ceil((H - P) / S) + 1)
     n_cols = max(1, math.ceil((W - P) / S) + 1)
     c = min(int(cx // S), n_cols - 1)
     r = min(int(cy // S), n_rows - 1)
-    x0, y0 = _tile_origin(r, c, W, H, P, S)
-    return _tile_rc_from_origin(x0, y0, S)
+    return r, c
 
 def _neighbor_tiles(r0: int, c0: int, W: int, H: int, P: int, S: int):
     n_rows = max(1, math.ceil((H - P) / S) + 1)
@@ -214,7 +259,6 @@ def _best_tile_for_object(pts_abs, cx, cy, W, H, P, S, min_area):
             continue
 
         area = _poly_area(poly / float(P)) * (P ** 2)
-        # owner preference on ties
         score = (area, 1 if (r, c) == (r0, c0) else 0)
         if score > (best_area, 1 if best and best == (r0, c0) else 0):
             best_area = area
