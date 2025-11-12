@@ -15,6 +15,8 @@ import shutil
 from typing import List, Tuple, Dict, Optional
 
 from ultralytics import YOLO
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
 
 from tta_obb import (
     predict_obb_with_tta,  # (model, img_bgr, conf, iou, imgsz, tta_mode, tta_merge_iou) -> (polys, classes, confs, [xywhr])
@@ -396,6 +398,145 @@ def harvest_val_artifacts(val_proj_dir: Path, dest_dir: Path):
         for p in val_proj_dir.rglob(fn):
             copy_if_exists(p, dest_dir)
 
+# ---------------------- SAHI sliced inference for OBB ----------------------
+def predict_obb_with_sahi_if_enabled(
+    use_sahi: bool,
+    weights_path: str,
+    img_bgr: np.ndarray,
+    conf: float,
+    device: Optional[str],
+    slice_w: int,
+    slice_h: int,
+    ovw: float,
+    ovh: float,
+    postprocess_type: str,
+) -> tuple[list[np.ndarray], list[int], list[float]]:
+    """
+    SAHIのスライス推論でOBB検出を実行し、(poly(4x2), cls, conf) を返す。
+    SAHIが無効 or import不可のときは (None, None, None) を返す。
+    """
+    if not use_sahi or AutoDetectionModel is None or get_sliced_prediction is None:
+        return None, None, None
+
+    # SAHIモデルの準備（Ultralytics OBBに対応）
+    try:
+        det_model = AutoDetectionModel.from_pretrained(
+            model_type="ultralytics",
+            model_path=weights_path,          # *.pt パス
+            confidence_threshold=conf,
+            device=device if device is not None else None,  # "0" / "0,1" でもOK
+        )
+    except Exception as e:
+        print(f"[WARN] SAHI setup failed: {e}")
+        return None, None, None
+
+    try:
+        # SAHI スライス推論
+        result = get_sliced_prediction(
+            img_bgr,
+            det_model,
+            slice_height=slice_h,
+            slice_width=slice_w,
+            overlap_height_ratio=ovh,
+            overlap_width_ratio=ovw,
+            postprocess_type=postprocess_type,   # "NMS" 推奨
+            # perform_standard_pred=False,  # 明示したい場合は有効化
+        )
+    except Exception as e:
+        print(f"[WARN] SAHI prediction failed: {e}")
+        return None, None, None
+
+    polys, classes, confs = [], [], []
+
+    # --- できるだけ堅牢に、多角形(4点)を取り出す ---
+    # SAHIはCOCO形式エクスポートができるので、まずはそこから polygon を優先取得
+    try:
+        # segmentation が OBBの4点になる実装に追従（無ければ後続のフォールバックで処理）
+        annos = result.to_coco_annotations()
+    except Exception:
+        annos = []
+
+    used = 0
+    for a in annos:
+        seg = a.get("segmentation", None)
+        if isinstance(seg, list) and len(seg) > 0 and isinstance(seg[0], (list, tuple)) and len(seg[0]) >= 8:
+            flat = seg[0][:8]  # 4点分
+            poly = np.array(flat, dtype=np.float32).reshape(4, 2)
+            polys.append(poly)
+            classes.append(int(a.get("category_id", 0)))
+            confs.append(float(a.get("score", a.get("confidence", conf))))
+            used += 1
+
+    # COCO経由で拾えなかった場合は、object_prediction_list から OBB を推測して回収
+    # （将来のSAHI変更に備えて複数の属性名を試す）
+    if used == 0:
+        opl = getattr(result, "object_prediction_list", []) or []
+        for op in opl:
+            # クラスID / スコア（無ければ推測）
+            try:
+                c = getattr(op.category, "id", None)
+                if c is None:
+                    c = getattr(op.category, "category_id", 0)
+                cid = int(c)
+            except Exception:
+                cid = 0
+
+            try:
+                sc = getattr(op.score, "value", None)
+                confv = float(sc) if sc is not None else float(conf)
+            except Exception:
+                confv = float(conf)
+
+            # OBBの4点を取得（属性の揺れに対応）
+            poly = None
+            # 1) 典型: op.obb / op.rotated_bbox / op.quad / op.points 等
+            for attr in ["obb", "rotated_bbox", "oriented_bbox", "quad", "points", "polygon"]:
+                obj = getattr(op, attr, None)
+                if obj is None:
+                    continue
+                # list/tupleで座標が入っているケース
+                if isinstance(obj, (list, tuple, np.ndarray)):
+                    arr = np.array(obj, dtype=np.float32).reshape(-1)
+                    if arr.size >= 8:
+                        poly = arr[:8].reshape(4, 2)
+                        break
+                # オブジェクトに to_xyxyxyxy / to_points などのメソッドがあるケース
+                for meth in ["to_xyxyxyxy", "to_points", "to_polygon", "to_list"]:
+                    fn = getattr(obj, meth, None)
+                    if callable(fn):
+                        arr = np.array(fn(), dtype=np.float32).reshape(-1)
+                        if arr.size >= 8:
+                            poly = arr[:8].reshape(4, 2)
+                            break
+                if poly is not None:
+                    break
+
+            # 2) 最後の手段: AABBしか無い場合はAABB→四角形に変換
+            if poly is None:
+                try:
+                    bb = getattr(op.bbox, "to_xyxy", None)
+                    bb = bb() if callable(bb) else bb
+                except Exception:
+                    bb = None
+                if bb is None:
+                    # bbox dict/tuple などから推測
+                    bb = getattr(op, "bbox", None)
+                try:
+                    if bb is not None:
+                        bb = np.array(bb, dtype=np.float32).reshape(-1)
+                        if bb.size >= 4:
+                            x1, y1, x2, y2 = bb[:4]
+                            poly = np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float32)
+                except Exception:
+                    poly = None
+
+            if poly is not None and poly.shape == (4, 2):
+                polys.append(poly)
+                classes.append(cid)
+                confs.append(confv)
+
+    return polys, classes, confs
+
 # ---------------------- Main ----------------------
 
 def main():
@@ -414,6 +555,16 @@ def main():
     # --- TTA options ---
     ap.add_argument("--tta", default="none", choices=["none","flips","rot90","all"], help="flip/rotate test-time augmentation")
     ap.add_argument("--tta_merge_iou", type=float, default=0.50, help="merge IoU for rotated-NMS across TTA views")
+    # --- SAHI slice options ---
+    ap.add_argument("--use_sahi_slice", action="store_true",
+                help="Use SAHI sliced inference when --tta=none")
+    ap.add_argument("--slice_width",  type=int, default=512)
+    ap.add_argument("--slice_height", type=int, default=512)
+    ap.add_argument("--overlap_width_ratio",  type=float, default=0.20)
+    ap.add_argument("--overlap_height_ratio", type=float, default=0.20)
+    ap.add_argument("--sahi_postprocess", choices=["NMS","UNION","NONE"], default="NMS",
+                    help="SAHI postprocess type (NMS recommended)")
+    
     ap.add_argument("--cfg", type=str, default=None, help="YAML file containing train section (with imgsz)")
     ap.add_argument("--map_iou_range", default="0.50:0.95:0.05",
                 help="IoU range for mAP (start:end:step), e.g., 0.50:0.95:0.05")
@@ -501,11 +652,78 @@ def main():
                     draw_poly(canvas, poly, C_GT, thick, label=txt)
                     gt_items.append({"cls": int(cls), "poly": poly.astype(np.float32)})
 
-            # Predictions with TTA merge
-            polys, pred_classes, pred_confs, _xywhr = predict_obb_with_tta(
-                model=model, img_bgr=as_bgr(img), conf=args.conf, iou=args.iou,
-                imgsz=imgsz, tta_mode=args.tta, tta_merge_iou=args.tta_merge_iou
-            )
+            # Predictions
+            if args.tta != "none":
+                # 既存のTTAマージ
+                polys, pred_classes, pred_confs, _xywhr = predict_obb_with_tta(
+                    model=model, img_bgr=as_bgr(img), conf=args.conf, iou=args.iou,
+                    imgsz=imgsz, tta_mode=args.tta, tta_merge_iou=args.tta_merge_iou
+                )
+                pred_legend = "Pred (TTA)"
+            else:
+                # TTAがnoneのときだけ SAHI のスライス推論を試す
+                sahi_polys, sahi_classes, sahi_confs = predict_obb_with_sahi_if_enabled(
+                    use_sahi=args.use_sahi_slice,
+                    weights_path=args.weights,
+                    img_bgr=as_bgr(img),
+                    conf=args.conf,
+                    device=args.device,
+                    slice_w=args.slice_width,
+                    slice_h=args.slice_height,
+                    ovw=args.overlap_width_ratio,
+                    ovh=args.overlap_height_ratio,
+                    postprocess_type=args.sahi_postprocess,
+                )
+
+                if sahi_polys is not None:
+                    polys, pred_classes, pred_confs = sahi_polys, sahi_classes, sahi_confs
+                    _xywhr = None
+                    pred_legend = "Pred (SAHI)"
+                else:
+                    # SAHIが無効/失敗 → 通常の単画像推論（TTAなし）
+                    res = model.predict(
+                        source=as_bgr(img),
+                        conf=args.conf,
+                        iou=args.iou,
+                        imgsz=imgsz,
+                        verbose=False,
+                        device=args.device if args.device is not None else None,
+                    )
+                    # Ultralytics OBB → polygon へ（あなたの tta_obb.py の obb_to_polygon 等が流用できるならそれでもOK）
+                    polys, pred_classes, pred_confs = [], [], []
+                    for r in (res or []):
+                        # r.obb または r.boxes.rbox など、環境によって保持場所が異なるのでいくつか試す
+                        obb = getattr(r, "obb", None) or getattr(getattr(r, "boxes", None), "rbox", None)
+                        if obb is not None and hasattr(obb, "xywhr"):
+                            xywhr = obb.xywhr.cpu().numpy()
+                            confs = getattr(obb, "conf", getattr(getattr(r, "boxes", None), "conf", None))
+                            confs = confs.cpu().numpy() if confs is not None else np.ones(len(xywhr), dtype=np.float32)
+                            clsids = getattr(obb, "cls", getattr(getattr(r, "boxes", None), "cls", None))
+                            clsids = clsids.cpu().numpy().astype(int) if clsids is not None else np.zeros(len(xywhr), dtype=int)
+                            for (cx,cy,w,h,ang), c, sc in zip(xywhr, clsids, confs):
+                                poly = obb_to_polygon(float(cx), float(cy), float(w), float(h), float(np.degrees(ang)))
+                                polys.append(poly.astype(np.float32))
+                                pred_classes.append(int(c))
+                                pred_confs.append(float(sc))
+                        else:
+                            # AABBのみ → AABBを四角形に
+                            boxes = getattr(r, "boxes", None)
+                            if boxes is None:
+                                continue
+                            xyxy = getattr(boxes, "xyxy", None)
+                            clsids = getattr(boxes, "cls", None)
+                            confs = getattr(boxes, "conf", None)
+                            if xyxy is None:
+                                continue
+                            xyxy = xyxy.cpu().numpy()
+                            clsids = clsids.cpu().numpy().astype(int) if clsids is not None else np.zeros(len(xyxy), dtype=int)
+                            confs = confs.cpu().numpy() if confs is not None else np.ones(len(xyxy), dtype=np.float32)
+                            for (x1,y1,x2,y2), c, sc in zip(xyxy, clsids, confs):
+                                poly = np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float32)
+                                polys.append(poly)
+                                pred_classes.append(int(c))
+                                pred_confs.append(float(sc))
+                    pred_legend = "Pred"
 
             # Draw
             for poly, cls, conf in zip(polys, pred_classes, pred_confs):
@@ -522,8 +740,8 @@ def main():
             y0 = 30
             cv2.putText(canvas, "GT", (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_GT, 2, cv2.LINE_AA)
             cv2.line(canvas, (60, y0-8), (120, y0-8), C_GT, thick, cv2.LINE_AA)
-            cv2.putText(canvas, "Pred (TTA)", (140, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_PR, 2, cv2.LINE_AA)
-            cv2.line(canvas, (270, y0-8), (350, y0-8), C_PR, thick, cv2.LINE_AA)
+            cv2.putText(canvas, pred_legend, (140, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_PR, 2, cv2.LINE_AA)
+            cv2.line(canvas, (270, y0-8), (430, y0-8), C_PR, thick, cv2.LINE_AA)
 
             out_path = out_dir / f"{img_path.stem}_gt_pred.png"
             cv2.imwrite(str(out_path), canvas)
