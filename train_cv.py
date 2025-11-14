@@ -16,6 +16,8 @@ import argparse, subprocess, sys
 from pathlib import Path
 import yaml
 from itertools import product
+import importlib
+from ultralytics import YOLO 
 
 def to_cli_kv(key, val):
     # YOLO CLI に渡す "key=value"
@@ -94,6 +96,8 @@ def main():
     ap.add_argument("--cfg", required=True, help="ハイパラYAML（下のテンプレ参照）")
     ap.add_argument("--start_fold", type=int, default=0, help="このfoldから開始")
     ap.add_argument("--end_fold", type=int, default=None, help="このfoldまで（含む）。未指定なら folds-1")
+    ap.add_argument("--augmod", default=None,
+                    help="外部Albumentationsモジュール（build_train_aug() を持つ）")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -130,6 +134,16 @@ def main():
     # スイープ組合せ（train_hp 内のリスト全てが対象）
     combos = make_sweep_combinations(train_hp)  # 例: [{"imgsz":1024}, {"imgsz":1280}, ...] など
 
+    aug_list = None
+    if args.augmod:
+        try:
+            augmod = importlib.import_module(args.augmod)
+            aug_list = augmod.build_train_aug()
+            print(f"[AUG] Loaded Albumentations from {args.augmod}")
+        except Exception as e:
+            print(f"[AUG] WARNING: failed to load {args.augmod}: {e}\n"
+                  f"      -> continue WITHOUT custom Albumentations.")
+
     for k in range(start_k, end_k + 1):
         fold_dir = root / f"fold{k}"
         data_yaml = fold_dir / "data.yaml"
@@ -148,32 +162,35 @@ def main():
                 suffix = name_suffix_from_combo(combo, default_imgsz=imgsz, default_epochs=epochs)
                 exp_name = f"{name_prefix}{k}_{Path(model).stem}_{suffix}"
 
-                # === train ===
-                base_args = {
-                    "data": str(data_yaml),
-                    "model": model,
-                    "project": project,
-                    "name": exp_name,
-                    "device": device,
-                }
-                # train の明示的キー（epochs/imgsz/seedなど）も this_train に含めて CLI に渡す
-                merged_train = {**base_args, **this_train}
-                cli_train = " ".join([to_cli_kv(k, v) for k, v in merged_train.items()])
-                cmd_train = f"yolo {task} train {cli_train}"
-                run_cmd(cmd_train)
+                print(f"\n[PY] yolo {task} train  (with augmentations={aug_list is not None})")
 
-                # === val on val split ===
+                y = YOLO(model)  # OBB対応の重み/モデルをロード
+
+                # train() に重複引数を渡さないように除去
+                safe_train = dict(this_train)
+                for k_rm in ["imgsz", "data", "project", "name", "device"]:
+                    safe_train.pop(k_rm, None)
+
+                y.train(
+                    data=str(data_yaml),
+                    project=project,
+                    name=exp_name,
+                    device=device,
+                    imgsz=imgsz,
+                    augmentations=aug_list,
+                    **safe_train,         
+                )
+
                 best = Path(project) / exp_name / "weights" / "best.pt"
-                merged_val  = {"data": str(data_yaml), "model": str(best), "imgsz": imgsz, **val_hp}
-                cli_val = " ".join([to_cli_kv(k, v) for k, v in merged_val.items()])
-                cmd_val = f"yolo {task} val {cli_val}"
-                run_cmd(cmd_val)
 
-                # === val on test split ===
-                merged_test = {"data": str(data_yaml), "model": str(best), "imgsz": imgsz, **test_hp}
-                cli_test = " ".join([to_cli_kv(k, v) for k, v in merged_test.items()])
-                cmd_test = f"yolo {task} val {cli_test}"
-                run_cmd(cmd_test)
+                # val on val split
+                print(f"[PY] yolo {task} val (val split)")
+                y_best = YOLO(str(best))
+                y_best.val(
+                    data=str(data_yaml),
+                    imgsz=imgsz,
+                    **val_hp
+                )
 
 if __name__ == "__main__":
     main()

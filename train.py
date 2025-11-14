@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YOLOv11 OBB: 最終モデル学習ランチャー（cvなし）
+YOLOv11 OBB: 最終モデル学習ランチャー
 - train: セクションに「リスト値」があれば全組合せスイープ（例: imgsz など）
 - models: に複数書けば各モデルもスイープ
-- 学習は data.yaml の train を使用（valは内部split）。評価は test のみ実施。
+- 学習は data.yaml の train を使用（valは内部split）。評価は test のみ実施（※本スクリプトは学習のみ）
 
 使い方例:
   python train.py \
     --data dat/final_data.yaml \
-    --cfg hyperparams.yaml
+    --cfg hyperparams.yaml \
+    --augmod microscopy_blur_aug
 
 cfg (例):
-task: obb                  # yolo サブコマンド（obb/detect等）
-project: runs_obb          # YOLOの出力プロジェクト
-name_prefix: final         # 実験名プレフィックス
+task: obb
+project: runs_obb
+name_prefix: final
 device: 0
 models:
   - yolo11n-obb.pt
@@ -26,41 +27,23 @@ train:
   cos_lr: True
   batch: 16
 test:
-  split: test              # ここは基本固定でOK（data.yamlにtest記載が必要）
+  split: test
   iou: 0.50:0.95
   save_json: True
   conf: 0.001
 """
 
-import argparse, subprocess, sys
+import argparse, sys
 from pathlib import Path
 import yaml
 from itertools import product
-
-def to_cli_kv(key, val):
-    # YOLO CLI に渡す "key=value"
-    if isinstance(val, bool):
-        sval = "True" if val else "False"
-    elif isinstance(val, (int, float)):
-        sval = str(val)
-    elif isinstance(val, (list, tuple)):
-        sval = ",".join(str(x) for x in val)
-    else:
-        sval = str(val)
-    if any(c.isspace() for c in sval):
-        return f'{key}="{sval}"'
-    return f"{key}={sval}"
-
-def run_cmd(cmd):
-    print("\n[CMD]", cmd)
-    proc = subprocess.run(cmd, shell=True)
-    if proc.returncode != 0:
-        sys.exit(proc.returncode)
+import importlib
+from ultralytics import YOLO
 
 def scalar_or_default(d, key, default):
     v = d.get(key, default)
     if isinstance(v, (list, tuple)):
-        return v[0]
+        return v[0] if v else default
     return v
 
 def make_sweep_combinations(train_hp: dict):
@@ -102,6 +85,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="最終学習用 data.yaml（train=cv_pool, test=test。valは未指定）")
     ap.add_argument("--cfg", required=True, help="ハイパラYAML（上のテンプレ参照）")
+    ap.add_argument("--augmod", default=None,
+                    help="外部Albumentationsモジュール名（build_train_aug() を持つ）。空文字で無効化")
     args = ap.parse_args()
 
     data_yaml = Path(args.data).resolve()
@@ -114,9 +99,9 @@ def main():
         cfg = yaml.safe_load(f) or {}
 
     # 設定の取得
-    task        = cfg.get("task", "obb")
-    train_hp    = cfg.get("train", {})           # yolo train に渡す key:val
-    test_hp     = cfg.get("test",  {"split": "test"})
+    task        = cfg.get("task", "obb")  # ここでは参照のみ（Python APIは自動判定）
+    train_hp    = cfg.get("train", {})    # yolo train に渡す key:val
+    test_hp     = cfg.get("test",  {"split": "test"})  # 学習のみのため未使用（将来拡張用）
     models      = cfg.get("models", [])
     project     = cfg.get("project", "runs_obb")
     name_prefix = cfg.get("name_prefix", "final")
@@ -130,6 +115,20 @@ def main():
     default_epochs = scalar_or_default(train_hp, "epochs", 100)
     default_imgsz  = scalar_or_default(train_hp, "imgsz", 1024)
     seed_default   = scalar_or_default(train_hp, "seed", 0)
+
+    # 外部Augロード
+    aug_list = None
+    if args.augmod:
+        try:
+            augmod = importlib.import_module(args.augmod)
+            if hasattr(augmod, "build_train_aug"):
+                aug_list = augmod.build_train_aug()
+                print(f"[AUG] Loaded Albumentations from {args.augmod}")
+            else:
+                print(f"[AUG] WARNING: {args.augmod} has no build_train_aug(); continue without custom aug.")
+        except Exception as e:
+            print(f"[AUG] WARNING: failed to load {args.augmod}: {e}\n"
+                  f"      -> continue WITHOUT custom Albumentations.")
 
     # スイープ組合せ
     combos = make_sweep_combinations(train_hp)
@@ -147,18 +146,24 @@ def main():
             suffix = name_suffix_from_combo(combo, default_imgsz=imgsz, default_epochs=epochs)
             exp_name = f"{name_prefix}_{Path(model).stem}_{suffix}"
 
-            # === train ===
-            base_args = {
-                "data": str(data_yaml),
-                "model": model,
-                "project": project,
-                "name": exp_name,
-                "device": device,
-            }
-            merged_train = {**base_args, **this_train}
-            cli_train = " ".join([to_cli_kv(k, v) for k, v in merged_train.items()])
-            cmd_train = f"yolo {task} train {cli_train}"
-            run_cmd(cmd_train)
+            # ====== Python APIで学習（augmentationsを注入） ======
+            print(f"\n[PY] yolo {task} train  (model={model}, name={exp_name}, imgsz={imgsz}, aug={aug_list is not None})")
+            y = YOLO(model)
+
+            # train() に重複引数を渡さないように除去
+            safe_train = dict(this_train)
+            for k_rm in ["imgsz", "data", "project", "name", "device", "model"]:
+                safe_train.pop(k_rm, None)
+
+            y.train(
+                data=str(data_yaml),
+                project=project,
+                name=exp_name,
+                device=device,
+                imgsz=imgsz,
+                augmentations=aug_list,
+                **safe_train,
+            )
 
 if __name__ == "__main__":
     main()
