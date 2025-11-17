@@ -28,5 +28,5 @@ def build_train_aug() -> List[A.BasicTransform]:
         # photometric,
         # A.GaussNoise(var_limit=(5.0, 25.0), p=0.2),
         # A.ImageCompression(quality_lower=50, quality_upper=95, p=0.2),
-        A.Defocus(radius=(2, 8), alias_blur=(0.5,1), p=0.5)
+        A.Defocus(radius=(2, 6), alias_blur=(0.3,0.8), p=0.3)
     ]
