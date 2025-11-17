@@ -570,6 +570,7 @@ def main():
                 help="IoU range for mAP (start:end:step), e.g., 0.50:0.95:0.05")
     ap.add_argument("--eval_iou_mode", default="obb", choices=["obb","aabb"],
                 help="IoU type for TTA metrics (obb=rotated polygon IoU, aabb=axis-aligned IoU)")
+    ap.add_argument("--recall_iou", type=float, default=0.50, help="IoU threshold for recall calculation")
     args = ap.parse_args()
 
     # mAP用IoUしきい値列を作成
@@ -760,7 +761,7 @@ def main():
             })
 
         print("\n[TTA EVAL] Computing TTA-based metrics (mAP@0.50 and mAP@0.50:0.95) ...")
-        tta_metrics = eval_tta_detections(tta_records, class_names, iou_thrs=map_iou_thrs, iou_mode=args.eval_iou_mode, conf_thresh=args.conf)
+        tta_metrics = eval_tta_detections(tta_records, class_names, iou_thrs=map_iou_thrs, iou_mode=args.eval_iou_mode, conf_thresh=args.conf, recall_iou=args.recall_iou)
 
         # 保存
         tta_json = metrics_dir / "metrics_tta_summary.json"
