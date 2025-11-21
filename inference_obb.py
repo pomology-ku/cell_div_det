@@ -12,16 +12,22 @@ Dir直下の .tif を逐次GPU推論し、以下のいずれか/両方を出力�
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
   # (A) COCO JSON 出力
-  python export_coco_from_yolo_obb.py -d /path/to/dir -m best.pt \
+  python inference_obb.py -d /path/to/dir -m best.pt \
       --out-json coco.json -s 1920 -g cuda:0 --half
 
   # (B) YOLO-OBB 出力（画像も保存）
-  python export_coco_from_yolo_obb.py -d /path/to/dir -m best.pt \
+  python inference_obb.py -d /path/to/dir -m best.pt \
       --yolo-obb-dir out_obb --save-images-mode copy
 
   # (A)+(B) 両方
-  python export_coco_from_yolo_obb.py -d /path/to/dir -m best.pt \
+  python inference_obb.py -d /path/to/dir -m best.pt \
       --out-json coco.json --yolo-obb-dir out_obb
+
+  # SAHI 経由
+  python inference_obb.py -d /path/to/dir -m best.pt \
+    --out-json coco.json --use_sahi_slice \
+    --slice-width 640 --slice-height 640 --overlap-width-ratio 0.30 --overlap-height-ratio 0.30 \
+    -c 0.25 -s 1920
 
 注意:
 - YOLO-OBB の学習/検証に使う場合は images/ と labels/ の両方が必要です。
@@ -38,6 +44,13 @@ from ultralytics import YOLO
 
 import cv2
 from tta_obb import predict_obb_with_tta
+
+try:
+    from sahi import AutoDetectionModel
+    from sahi.predict import get_sliced_prediction
+except Exception:
+    AutoDetectionModel = None
+    get_sliced_prediction = None
 
 IMG_EXT = ".tif"
 
@@ -121,6 +134,128 @@ def poly4_to_xyrwha(poly):
     a, w, h = _normalize_angle_wh(a, w, h)
     return float(xc), float(yc), float(w), float(h), float(a)
 
+def _normalize_sahi_device(dev: str | None) -> str | None:
+    if dev is None:
+        return None
+    s = str(dev).strip()
+    if "," in s:
+        s = s.split(",")[0].strip()
+    # accept "cuda:0"/"0"/"cpu"
+    if s.isdigit():
+        return s  # SAHI/torch will treat "0" as cuda:0 when available
+    return s
+
+def _predict_obb_with_sahi(
+    weights_path: str,
+    img_bgr: np.ndarray,
+    *,
+    conf: float,
+    device: str | None,
+    slice_w: int,
+    slice_h: int,
+    ovw: float,
+    ovh: float,
+    postprocess_type: str,
+) -> tuple[list[np.ndarray], list[int], list[float], list[tuple[float,float,float,float,float]]]:
+    """
+    SAHI sliced inference.
+    Returns:
+      polys_np: list of (4,2) float32 polygons
+      classes:  list[int] (model indices)
+      confs:    list[float]
+      xywhr:    list of (cx,cy,w,h,deg) estimated from polygon
+    """
+    if AutoDetectionModel is None or get_sliced_prediction is None:
+        return [], [], [], []
+
+    det_model = AutoDetectionModel.from_pretrained(
+        model_type="ultralytics",
+        model_path=weights_path,
+        confidence_threshold=conf,
+        device=_normalize_sahi_device(device),
+    )
+
+    # SAHI expects RGB
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    result = get_sliced_prediction(
+        img_rgb,
+        det_model,
+        slice_height=slice_h,
+        slice_width=slice_w,
+        overlap_height_ratio=ovh,
+        overlap_width_ratio=ovw,
+        postprocess_type=postprocess_type,
+    )
+
+    polys_np, classes, confs, xywhr = [], [], [], []
+
+    # Prefer object_prediction_list
+    opl = getattr(result, "object_prediction_list", []) or []
+    for op in opl:
+        # bbox がある場合もあるが、OBBが取れれば polygon 優先
+        poly = None
+        # try common attributes
+        for attr in ["obb", "rotated_bbox", "oriented_bbox", "quad", "points", "polygon"]:
+            obj = getattr(op, attr, None)
+            if obj is None:
+                continue
+            # list-like
+            try:
+                arr = np.array(obj, dtype=np.float32).reshape(-1)
+                if arr.size >= 8:
+                    poly = arr[:8].reshape(4, 2)
+                    break
+            except Exception:
+                pass
+            # method-based
+            for meth in ["to_xyxyxyxy", "to_points", "to_polygon", "to_list"]:
+                fn = getattr(obj, meth, None)
+                if callable(fn):
+                    arr = np.array(fn(), dtype=np.float32).reshape(-1)
+                    if arr.size >= 8:
+                        poly = arr[:8].reshape(4, 2)
+                        break
+            if poly is not None:
+                break
+
+        if poly is None:
+            # fallback: AABB -> polygon
+            try:
+                bb = getattr(op.bbox, "to_xyxy", None)
+                bb = bb() if callable(bb) else bb
+            except Exception:
+                bb = getattr(op, "bbox", None)
+            if bb is not None:
+                x1, y1, x2, y2 = np.array(bb, dtype=np.float32).reshape(-1)[:4]
+                poly = np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float32)
+
+        if poly is None or poly.shape != (4,2):
+            continue
+
+        # class & score
+        try:
+            cid = getattr(op.category, "id", None)
+            if cid is None:
+                cid = getattr(op.category, "category_id", 0)
+            cid = int(cid)
+        except Exception:
+            cid = 0
+        try:
+            sc = getattr(op.score, "value", None)
+            sc = float(sc) if sc is not None else float(conf)
+        except Exception:
+            sc = float(conf)
+
+        # estimate OBB params from polygon
+        xc, yc, w, h, a = poly4_to_xyrwha(poly.reshape(-1))
+        xywhr.append((xc, yc, w, h, np.degrees(a)))
+        polys_np.append(poly.astype(np.float32))
+        classes.append(cid)
+        confs.append(sc)
+
+    return polys_np, classes, confs, xywhr
+
 # ---------- 画像保存ユーティリティ ----------
 
 def ensure_dir(p: Path):
@@ -185,6 +320,15 @@ def main():
                     help="rotated-NMS IoU for merging TTA views")
     ap.add_argument("--nms-iou", type=float, default=0.70,
                     help="per-call NMS IoU passed to Ultralytics model.predict")
+    # sahi
+    ap.add_argument("--use_sahi_slice", action="store_true",
+                help="Use SAHI sliced inference when --tta=none (to avoid double augment).")
+    ap.add_argument("--slice-width",  type=int, default=640)
+    ap.add_argument("--slice-height", type=int, default=640)
+    ap.add_argument("--overlap-width-ratio",  type=float, default=0.30)
+    ap.add_argument("--overlap-height-ratio", type=float, default=0.30)
+    ap.add_argument("--sahi-postprocess", choices=["NMS","UNION","NONE"], default="NMS",
+                    help="Postprocess type for SAHI (NMS recommended).")
     args = ap.parse_args()
 
     # どちらも指定なしはエラー
@@ -267,16 +411,28 @@ def main():
             if args.save_images_mode != "none":
                 link_or_copy(p, dst_img, args.save_images_mode)
 
-        # TTA推論（複数ビュー→逆変換→集約→回転NMS）
-        polys_np, pred_classes, pred_confs, xywhr_merged = predict_obb_with_tta(
-            model=model,
-            img_bgr=img_np,
-            conf=args.conf,
-            iou=args.nms_iou,          # ← Ultralytics側のNMS IoU
-            imgsz=args.imgsz,
-            tta_mode=args.tta,
-            tta_merge_iou=args.tta_merge_iou  # ← TTAビュー統合用の回転NMS IoU
-        )
+        if args.tta == "none" and args.use_sahi_slice:
+            polys_np, pred_classes, pred_confs, xywhr_merged = _predict_obb_with_sahi(
+                weights_path=args.model,
+                img_bgr=img_np,
+                conf=args.conf,
+                device=args.device,
+                slice_w=args.slice_width,
+                slice_h=args.slice_height,
+                ovw=args.overlap_width_ratio,
+                ovh=args.overlap_height_ratio,
+                postprocess_type=args.sahi_postprocess,
+            )
+        else:
+            polys_np, pred_classes, pred_confs, xywhr_merged = predict_obb_with_tta(
+                model=model,
+                img_bgr=img_np,
+                conf=args.conf,
+                iou=args.nms_iou,
+                imgsz=args.imgsz,
+                tta_mode=args.tta,
+                tta_merge_iou=args.tta_merge_iou
+            )
 
         # 1画像分: 出力用の構造に詰め替え
         polys = []       # [(poly(list[8]), cls(int))]
