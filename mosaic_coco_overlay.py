@@ -16,6 +16,7 @@ New options:
   --gt-color R,G,B        : color for GT (default 255,0,255)
   --gt-line INT           : line width for GT (default 3)
   --gt-alpha INT          : fill alpha for GT (0..255, default 0 no fill)
+  --no-overlay            : モザイクのみ保存
 """
 
 import argparse
@@ -227,8 +228,8 @@ def main():
 
     # Placement
     p = ap.add_argument_group("Placement")
-    p.add_argument("--place-mode", choices=["offset", "stage", "stage+offset"], default="stage+offset",
-                   help="Tile placement: use OffsetX/Y only, Stage X/Y with ViewWidth/Height, or both")
+    p.add_argument("--place-mode", choices=["offset", "stage", "stage+offset", "grid"], default="stage+offset",
+                   help="Tile placement: use OffsetX/Y only, Stage X/Y with ViewWidth/Height, both, or grid")
     p.add_argument("--x-reverse", choices=["auto", "true", "false"], default="auto",
                    help="Flip stage X axis (mirror). 'auto' reads XML XIsReverse if present")
 
@@ -251,16 +252,21 @@ def main():
 
     # Grid params (when --place-mode grid)
     p.add_argument("--grid-overlap-x", type=float, default=0.0,
-                help="Horizontal overlap ratio [0..0.9] used in grid mode (0=no overlap)")
+                   help="Horizontal overlap ratio [0..0.9] used in grid mode (0=no overlap)")
     p.add_argument("--grid-overlap-y", type=float, default=0.0,
-                help="Vertical overlap ratio [0..0.9] used in grid mode (0=no overlap)")
+                   help="Vertical overlap ratio [0..0.9] used in grid mode (0=no overlap)")
 
     # Cropping
     c = ap.add_argument_group("Cropping")
     c.add_argument("--crop", choices=["none", "tiles"], default="none",
-                help="Auto-crop output. 'tiles' crops to union of pasted tiles.")
+                   help="Auto-crop output. 'tiles' crops to union of pasted tiles.")
     c.add_argument("--crop-margin", type=int, default=0,
-                help="Extra margin (px) around crop box after scaling")
+                   help="Extra margin (px) around crop box after scaling")
+
+    # Overlay control
+    oc = ap.add_argument_group("Overlay control")
+    oc.add_argument("--no-overlay", action="store_true",
+        help="Disable COCO/GT overlays and tile borders/labels; save plain mosaic only.")
 
     args = ap.parse_args()
 
@@ -303,20 +309,17 @@ def main():
         tlx = (sx - vw / 2.0) * px_per_u_x
         tly = (cy - vh / 2.0) * px_per_u_y
         return tlx, tly
-    
+
     # --- grid mode precompute ---
     min_idx_x = min(t["idx_x"] for t in tiles)
     min_idx_y = min(t["idx_y"] for t in tiles)
-    # 代表タイルの大きさ（行列で異なる場合は平均でもOK）
     tile_w_ref = sum(t["w"] for t in tiles) / max(1, len(tiles))
     tile_h_ref = sum(t["h"] for t in tiles) / max(1, len(tiles))
     stride_x = tile_w_ref * max(0.1, 1.0 - max(0.0, min(0.9, args.grid_overlap_x)))
     stride_y = tile_h_ref * max(0.1, 1.0 - max(0.0, min(0.9, args.grid_overlap_y)))
 
-
     for t in tiles:
         if args.place_mode == "grid":
-            # 左上を最小の Index を原点にして等間隔配置
             x = (t["idx_x"] - min_idx_x) * stride_x
             y = (t["idx_y"] - min_idx_y) * stride_y
         elif args.place_mode == "offset":
@@ -377,7 +380,7 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to paste {tile_path}: {e}")
 
-    # Prepare scaled image and drawing context
+    # Prepare scaled image
     if scale != 1.0:
         new_w = max(1, int(round(canvas_w * scale)))
         new_h = max(1, int(round(canvas_h * scale)))
@@ -388,23 +391,25 @@ def main():
     if out_scaled.mode != "RGBA":
         out_scaled = out_scaled.convert("RGBA")
 
-    draw = ImageDraw.Draw(out_scaled)
+    # -------------------- Overlays (optional) --------------------
+    if not args.no_overlay:
+        draw = ImageDraw.Draw(out_scaled)
 
-    # Debug tile borders/labels
-    if args.tile_border or args.tile_label:
-        font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
-        for t, x, y in positions:
-            x0 = int(round((x + shift_x) * scale))
-            y0 = int(round((y + shift_y) * scale))
-            x1 = int(round((x + shift_x + t["w"]) * scale))
-            y1 = int(round((y + shift_y + t["h"]) * scale))
-            if args.tile_border:
-                draw.rectangle([x0, y0, x1, y1], outline=(255, 255, 255, 128), width=max(1, int(args.line)))
-            if args.tile_label:
-                txt = f"({t['idx_x']},{t['idx_y']})"
-                draw.text((x0 + 4, y0 + 4), txt, fill=(255, 255, 0, 200), font=font)
+        # Debug tile borders/labels
+        if args.tile_border or args.tile_label:
+            font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
+            for t, x, y in positions:
+                x0 = int(round((x + shift_x) * scale))
+                y0 = int(round((y + shift_y) * scale))
+                x1 = int(round((x + shift_x + t["w"]) * scale))
+                y1 = int(round((y + shift_y + t["h"]) * scale))
+                if args.tile_border:
+                    draw.rectangle([x0, y0, x1, y1], outline=(255, 255, 255, 128), width=max(1, int(args.line)))
+                if args.tile_label:
+                    txt = f"({t['idx_x']},{t['idx_y']})"
+                    draw.text((x0 + 4, y0 + 4), txt, fill=(255, 255, 0, 200), font=font)
 
-    # Build mapping stem -> (offset, size)
+        # Build mapping stem -> (offset, size)
     tile_info = {}
     for t, x, y in positions:
         key = normalize_key(t["image_path"])
@@ -416,117 +421,122 @@ def main():
             "path": str(img_root / t["image_path"]),
         }
 
-    # Draw COCO detections (AABB)
-    font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
-    matched = 0
-    skipped = 0
-    for img_id, im in list(img_by_id.items()):
-        key = normalize_key(im.get("file_name", ""))
-        tinfo = tile_info.get(key)
-        if tinfo is None:
-            print(f"[WARN] No tile match for COCO image: file_name='{im.get('file_name')}' (key='{key}')")
-            skipped += 1
-            continue
-
-        matched += 1
-        ann_list = anns_by_img.get(img_id, [])
-        if not ann_list:
-            continue
-
-        ox = tinfo["shifted_x"]
-        oy = tinfo["shifted_y"]
-
-        for ann in ann_list:
-            bbox = ann.get("bbox")
-            if not bbox or len(bbox) != 4:
+    if not args.no_overlay:
+        # Draw COCO detections (AABB)
+        font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
+        matched = 0
+        skipped = 0
+        for img_id, im in list(img_by_id.items()):
+            key = normalize_key(im.get("file_name", ""))
+            tinfo = tile_info.get(key)
+            if tinfo is None:
+                print(f"[WARN] No tile match for COCO image: file_name='{im.get('file_name')}' (key='{key}')")
+                skipped += 1
                 continue
-            x, y, w, h = bbox
-            gx0 = (ox + x) * scale
-            gy0 = (oy + y) * scale
-            gx1 = (ox + x + w) * scale
-            gy1 = (oy + y + h) * scale
 
-            cat_id = ann.get("category_id", 0)
-            color = hash_color(cat_id)
-            lw = max(1, int(args.line))
-            if args.alpha > 0:
-                draw.rectangle([gx0, gy0, gx1, gy1], fill=(color[0], color[1], color[2], int(args.alpha)))
-            draw.rectangle([gx0, gy0, gx1, gy1], outline=(color[0], color[1], color[2], 255), width=lw)
+            matched += 1
+            ann_list = anns_by_img.get(img_id, [])
+            if not ann_list:
+                continue
 
-            if args.show_label != "none":
-                if args.show_label == "class_name":
-                    label = cat_name.get(cat_id, str(cat_id))
-                else:
-                    label = str(cat_id)
-                try:
-                    l, t, r, b = draw.textbbox((0, 0), label, font=font)
-                    tw, th = (r - l), (b - t)
-                except Exception:
-                    tw, th = draw.textlength(label, font=font), font.size
-                bx0, by0 = gx0, gy0 - th - 2
-                bx1, by1 = gx0 + tw + 4, gy0
-                draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 160))
-                draw.text((gx0 + 2, gy0 - th - 1), label, fill=(255, 255, 255, 230), font=font)
+            ox = tinfo["shifted_x"]
+            oy = tinfo["shifted_y"]
 
-    print(f"[INFO] Matched COCO images to tiles: {matched}, skipped (no tile): {skipped}")
-
-    # --------------------- GT overlay (optional) ---------------------
-    if args.gt_dir:
-        gt_root = Path(args.gt_dir)
-        if not gt_root.exists():
-            print(f"[WARN] --gt-dir not found: {gt_root}")
-        else:
-            gt_index = build_gt_index(gt_root, args.gt_strip_prefix)
-            gt_color = parse_rgb(args.gt_color, default=(255, 0, 255))
-            gt_alpha = max(0, min(255, int(args.gt_alpha)))
-            gt_line = max(1, int(args.gt_line))
-
-            gt_found_tiles = 0
-            gt_missing_tiles = 0
-            total_gt_files_used = 0
-
-            for stem, tinfo in tile_info.items():
-                lbl_paths = gt_index.get(stem)
-                if not lbl_paths:
-                    gt_missing_tiles += 1
+            for ann in ann_list:
+                bbox = ann.get("bbox")
+                if not bbox or len(bbox) != 4:
                     continue
+                x, y, w, h = bbox
+                gx0 = (ox + x) * scale
+                gy0 = (oy + y) * scale
+                gx1 = (ox + x + w) * scale
+                gy1 = (oy + y + h) * scale
 
-                gt_found_tiles += 1
-                ox = tinfo["shifted_x"]; oy = tinfo["shifted_y"]
-                tw = tinfo["w"];         th = tinfo["h"]
+                cat_id = ann.get("category_id", 0)
+                color = hash_color(cat_id)
+                lw = max(1, int(args.line))
+                if args.alpha > 0:
+                    draw.rectangle([gx0, gy0, gx1, gy1], fill=(color[0], color[1], color[2], int(args.alpha)))
+                draw.rectangle([gx0, gy0, gx1, gy1], outline=(color[0], color[1], color[2], 255), width=lw)
 
-                # 同じ stem に複数 GT があれば全部重ねる
-                for lbl_path in lbl_paths:
+                if args.show_label != "none":
+                    if args.show_label == "class_name":
+                        label = cat_name.get(cat_id, str(cat_id))
+                    else:
+                        label = str(cat_id)
                     try:
-                        with open(lbl_path, "r", encoding="utf-8") as f:
-                            lines = f.readlines()
-                    except Exception as e:
-                        print(f"[WARN] Failed to read GT file {lbl_path}: {e}")
+                        l, t, r, b = draw.textbbox((0, 0), label, font=font)
+                        tw, th = (r - l), (b - t)
+                    except Exception:
+                        tw, th = draw.textlength(label, font=font), font.size
+                    bx0, by0 = gx0, gy0 - th - 2
+                    bx1, by1 = gx0 + tw + 4, gy0
+                    draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 160))
+                    draw.text((gx0 + 2, gy0 - th - 1), label, fill=(255, 255, 255, 230), font=font)
+
+        print(f"[INFO] Matched COCO images to tiles: {matched}, skipped (no tile): {skipped}")
+
+        # --------------------- GT overlay (optional) ---------------------
+        if args.gt_dir:
+            gt_root = Path(args.gt_dir)
+            if not gt_root.exists():
+                print(f"[WARN] --gt-dir not found: {gt_root}")
+            else:
+                gt_index = build_gt_index(gt_root, args.gt_strip_prefix)
+                gt_color = parse_rgb(args.gt_color, default=(255, 0, 255))
+                gt_alpha = max(0, min(255, int(args.gt_alpha)))
+                gt_line = max(1, int(args.gt_line))
+
+                gt_found_tiles = 0
+                gt_missing_tiles = 0
+                total_gt_files_used = 0
+
+                for stem, tinfo in tile_info.items():
+                    lbl_paths = gt_index.get(stem)
+                    if not lbl_paths:
+                        gt_missing_tiles += 1
                         continue
 
-                    used_any = False
-                    for ln in lines:
-                        poly = parse_yolo_obb_line(ln, tw, th)
-                        if not poly:
+                    gt_found_tiles += 1
+                    ox = tinfo["shifted_x"]; oy = tinfo["shifted_y"]
+                    tw = tinfo["w"];         th = tinfo["h"]
+
+                    # 同じ stem に複数 GT があれば全部重ねる
+                    for lbl_path in lbl_paths:
+                        try:
+                            with open(lbl_path, "r", encoding="utf-8") as f:
+                                lines = f.readlines()
+                        except Exception as e:
+                            print(f"[WARN] Failed to read GT file {lbl_path}: {e}")
                             continue
-                        poly_scaled = [((ox + px) * scale, (oy + py) * scale) for (px, py) in poly]
-                        if gt_alpha > 0:
-                            draw.polygon(poly_scaled, fill=(gt_color[0], gt_color[1], gt_color[2], gt_alpha))
-                        draw.polygon(poly_scaled, outline=(gt_color[0], gt_color[1], gt_color[2], 255))
-                        if gt_line > 1:
-                            for i in range(4):
-                                x0, y0 = poly_scaled[i]
-                                x1, y1 = poly_scaled[(i + 1) % 4]
-                                draw.line([x0, y0, x1, y1],
+
+                        used_any = False
+                        for ln in lines:
+                            poly = parse_yolo_obb_line(ln, tw, th)
+                            if not poly:
+                                continue
+                            poly_scaled = [((ox + px) * scale, (oy + py) * scale) for (px, py) in poly]
+                            if gt_alpha > 0:
+                                draw.polygon(poly_scaled, fill=(gt_color[0], gt_color[1], gt_color[2], gt_alpha))
+                            draw.polygon(poly_scaled, outline=(gt_color[0], gt_color[1], gt_color[2], 255))
+                            if gt_line > 1:
+                                for i in range(4):
+                                    x0, y0 = poly_scaled[i]
+                                    x1, y1 = poly_scaled[(i + 1) % 4]
+                                    draw.line(
+                                        [x0, y0, x1, y1],
                                         fill=(gt_color[0], gt_color[1], gt_color[2], 255),
-                                        width=gt_line)
-                        used_any = True
+                                        width=gt_line,
+                                    )
+                            used_any = True
 
-                    if used_any:
-                        total_gt_files_used += 1
+                        if used_any:
+                            total_gt_files_used += 1
 
-            print(f"[INFO] GT overlay: tiles matched {gt_found_tiles}, tiles without GT {gt_missing_tiles}, "
-                f"GT files used {total_gt_files_used}")
+                print(
+                    f"[INFO] GT overlay: tiles matched {gt_found_tiles}, "
+                    f"tiles without GT {gt_missing_tiles}, GT files used {total_gt_files_used}"
+                )
 
     # ---------------- Auto-crop (optional) ----------------
     if args.crop == "tiles":
@@ -556,7 +566,8 @@ def main():
 
     # Save
     out_scaled.save(out_path)
-    print(f"[OK] Wrote mosaic with overlays: {out_path}  (scale={scale:.4f}, canvas={canvas_w}x{canvas_h})")
+    status = "without overlays" if args.no_overlay else "with overlays"
+    print(f"[OK] Wrote mosaic {status}: {out_path}  (scale={scale:.4f}, canvas={canvas_w}x{canvas_h})")
 
 
 if __name__ == "__main__":
