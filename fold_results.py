@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-aggregate_from_train_cfg.py (v2)
+fold_results.py (v2)
 
 - train.yaml のリスト軸に加え、各 run の args.yaml / hyp.yaml を総当りで走査し、
   実際に値が変わっているキーを “自動軸” として追加採用（例: mosaic, shear, translate, scale, mixup, flip系 等）
@@ -31,6 +31,14 @@ MAP5095_CANDIDATES = [
 MAP50_CANDIDATES = [
     "metrics/mAP50(OBB)", "metrics/mAP50(B)", "metrics/mAP50",
     "mAP50(OBB)", "mAP50(B)", "mAP50", "map50"
+]
+RECALL_CANDIDATES = [
+    "metrics/recall(OBB)", "metrics/recall(B)", "metrics/recall",
+    "recall(OBB)", "recall(B)", "recall", "mr"
+]
+PRECISION_CANDIDATES = [
+    "metrics/precision(OBB)", "metrics/precision(B)", "metrics/precision",
+    "precision(OBB)", "precision(B)", "precision", "mp"
 ]
 EPOCH_COLS = ["epoch", "Epoch", "epochs"]
 
@@ -87,20 +95,50 @@ def find_col(df: pd.DataFrame, candidates):
 def get_best_metrics(df: pd.DataFrame) -> dict:
     m95_col = find_col(df, MAP5095_CANDIDATES)
     m50_col = find_col(df, MAP50_CANDIDATES)
+    recall_col = find_col(df, RECALL_CANDIDATES)
+    precision_col = find_col(df, PRECISION_CANDIDATES)
     ep_col  = find_col(df, EPOCH_COLS)
 
     out = {"metric_col": m95_col, "metric50_col": m50_col, "epoch_col": ep_col}
     if m95_col is None and m50_col is None:
         return {**out,
                 "best_mAP50-95": None, "best_epoch_mAP50-95": None,
-                "best_mAP50": None, "best_epoch_mAP50": None}
+                "best_mAP50": None, "best_epoch_mAP50": None,
+                "best_recall": None, "best_epoch_recall": None,
+                "best_precision": None, "best_epoch_precision": None}
     if m95_col is not None:
         idx = df[m95_col].astype(float).idxmax()
         out["best_mAP50-95"] = float(df.loc[idx, m95_col])
         out["best_epoch_mAP50-95"] = int(df.loc[idx, ep_col]) if ep_col else int(idx)
+        # best epoch での recall と precision
+        best_epoch = int(df.loc[idx, ep_col]) if ep_col else int(idx)
+        if recall_col is not None:
+            try:
+                out["best_recall"] = float(df.loc[idx, recall_col])
+                out["best_epoch_recall"] = best_epoch
+            except (ValueError, KeyError):
+                out["best_recall"] = None
+                out["best_epoch_recall"] = None
+        else:
+            out["best_recall"] = None
+            out["best_epoch_recall"] = None
+        if precision_col is not None:
+            try:
+                out["best_precision"] = float(df.loc[idx, precision_col])
+                out["best_epoch_precision"] = best_epoch
+            except (ValueError, KeyError):
+                out["best_precision"] = None
+                out["best_epoch_precision"] = None
+        else:
+            out["best_precision"] = None
+            out["best_epoch_precision"] = None
     else:
         out["best_mAP50-95"] = None
         out["best_epoch_mAP50-95"] = None
+        out["best_recall"] = None
+        out["best_epoch_recall"] = None
+        out["best_precision"] = None
+        out["best_epoch_precision"] = None
     if m50_col is not None:
         idx2 = df[m50_col].astype(float).idxmax()
         out["best_mAP50"] = float(df.loc[idx2, m50_col])
@@ -108,6 +146,63 @@ def get_best_metrics(df: pd.DataFrame) -> dict:
     else:
         out["best_mAP50"] = None
         out["best_epoch_mAP50"] = None
+    return out
+
+def get_last_epoch_metrics(df: pd.DataFrame) -> dict:
+    """最後のepochの結果を取得"""
+    ep_col = find_col(df, EPOCH_COLS)
+    m95_col = find_col(df, MAP5095_CANDIDATES)
+    m50_col = find_col(df, MAP50_CANDIDATES)
+    recall_col = find_col(df, RECALL_CANDIDATES)
+    precision_col = find_col(df, PRECISION_CANDIDATES)
+    
+    if df.empty:
+        return {
+            "last_epoch": None,
+            "last_mAP50-95": None,
+            "last_mAP50": None,
+            "last_recall": None,
+            "last_precision": None,
+        }
+    
+    # 最後の行を取得
+    last_idx = df.index[-1]
+    last_epoch = int(df.loc[last_idx, ep_col]) if ep_col else int(last_idx) + 1
+    
+    out = {"last_epoch": last_epoch}
+    
+    if m95_col is not None:
+        try:
+            out["last_mAP50-95"] = float(df.loc[last_idx, m95_col])
+        except (ValueError, KeyError):
+            out["last_mAP50-95"] = None
+    else:
+        out["last_mAP50-95"] = None
+    
+    if m50_col is not None:
+        try:
+            out["last_mAP50"] = float(df.loc[last_idx, m50_col])
+        except (ValueError, KeyError):
+            out["last_mAP50"] = None
+    else:
+        out["last_mAP50"] = None
+    
+    if recall_col is not None:
+        try:
+            out["last_recall"] = float(df.loc[last_idx, recall_col])
+        except (ValueError, KeyError):
+            out["last_recall"] = None
+    else:
+        out["last_recall"] = None
+    
+    if precision_col is not None:
+        try:
+            out["last_precision"] = float(df.loc[last_idx, precision_col])
+        except (ValueError, KeyError):
+            out["last_precision"] = None
+    else:
+        out["last_precision"] = None
+    
     return out
 
 def parse_name_fallback(name: str) -> dict:
@@ -277,6 +372,7 @@ def main():
 
         axes_in_run = load_run_axes(run_dir)
         best = get_best_metrics(rdf)
+        last = get_last_epoch_metrics(rdf)
 
         row = {"exp_name": run_dir.name, "exp_path": str(run_dir)}
         # まずは基軸（train.yaml 由来）
@@ -290,12 +386,24 @@ def main():
                 runs_axes_values[k] = set()
             runs_axes_values[k].add(v)
 
-        # metrics
+        # metrics (best)
         row.update({
             "best_mAP50-95": best.get("best_mAP50-95"),
             "best_epoch_mAP50-95": best.get("best_epoch_mAP50-95"),
             "best_mAP50": best.get("best_mAP50"),
             "best_epoch_mAP50": best.get("best_epoch_mAP50"),
+            "best_recall": best.get("best_recall"),
+            "best_epoch_recall": best.get("best_epoch_recall"),
+            "best_precision": best.get("best_precision"),
+            "best_epoch_precision": best.get("best_epoch_precision"),
+        })
+        # metrics (last epoch)
+        row.update({
+            "last_epoch": last.get("last_epoch"),
+            "last_mAP50-95": last.get("last_mAP50-95"),
+            "last_mAP50": last.get("last_mAP50"),
+            "last_recall": last.get("last_recall"),
+            "last_precision": last.get("last_precision"),
         })
         rows.append(row)
 
@@ -346,30 +454,72 @@ def main():
     for ax in sweep_axes:
         if ax not in df.columns:
             continue
-        g = df.groupby(ax, dropna=False).agg(
-            n=("score_for_group","count"),
-            mean=("score_for_group","mean"),
-            std=("score_for_group","std"),
-            mean_mAP50_95=("best_mAP50-95","mean"),
-            std_mAP50_95=("best_mAP50-95","std"),
-            mean_mAP50=("best_mAP50","mean"),
-            std_mAP50=("best_mAP50","std"),
-        ).reset_index().sort_values(ax)
+        agg_dict = {
+            "n": ("score_for_group", "count"),
+            "mean": ("score_for_group", "mean"),
+            "std": ("score_for_group", "std"),
+            "mean_mAP50_95": ("best_mAP50-95", "mean"),
+            "std_mAP50_95": ("best_mAP50-95", "std"),
+            "mean_mAP50": ("best_mAP50", "mean"),
+            "std_mAP50": ("best_mAP50", "std"),
+        }
+        # recall と precision が存在する場合のみ追加
+        if "best_recall" in df.columns:
+            agg_dict["mean_best_recall"] = ("best_recall", "mean")
+            agg_dict["std_best_recall"] = ("best_recall", "std")
+        if "last_recall" in df.columns:
+            agg_dict["mean_last_recall"] = ("last_recall", "mean")
+            agg_dict["std_last_recall"] = ("last_recall", "std")
+        if "best_precision" in df.columns:
+            agg_dict["mean_best_precision"] = ("best_precision", "mean")
+            agg_dict["std_best_precision"] = ("best_precision", "std")
+        if "last_precision" in df.columns:
+            agg_dict["mean_last_precision"] = ("last_precision", "mean")
+            agg_dict["std_last_precision"] = ("last_precision", "std")
+        if "last_mAP50-95" in df.columns:
+            agg_dict["mean_last_mAP50_95"] = ("last_mAP50-95", "mean")
+            agg_dict["std_last_mAP50_95"] = ("last_mAP50-95", "std")
+        if "last_mAP50" in df.columns:
+            agg_dict["mean_last_mAP50"] = ("last_mAP50", "mean")
+            agg_dict["std_last_mAP50"] = ("last_mAP50", "std")
+        
+        g = df.groupby(ax, dropna=False).agg(**agg_dict).reset_index().sort_values(ax)
         out = out_dir / f"summary_by_{ax}.csv"
         g.to_csv(out, index=False)
         print(f"[OK] 保存: {out}")
 
     # ==== 5) 全軸の組合せ集計（採用軸が2つ以上あるとき） ====
     if len(sweep_axes) >= 2 and all(ax in df.columns for ax in sweep_axes):
-        g = df.groupby(sweep_axes, dropna=False).agg(
-            n=("score_for_group","count"),
-            mean=("score_for_group","mean"),
-            std=("score_for_group","std"),
-            mean_mAP50_95=("best_mAP50-95","mean"),
-            std_mAP50_95=("best_mAP50-95","std"),
-            mean_mAP50=("best_mAP50","mean"),
-            std_mAP50=("best_mAP50","std"),
-        ).reset_index().sort_values(sweep_axes)
+        agg_dict = {
+            "n": ("score_for_group", "count"),
+            "mean": ("score_for_group", "mean"),
+            "std": ("score_for_group", "std"),
+            "mean_mAP50_95": ("best_mAP50-95", "mean"),
+            "std_mAP50_95": ("best_mAP50-95", "std"),
+            "mean_mAP50": ("best_mAP50", "mean"),
+            "std_mAP50": ("best_mAP50", "std"),
+        }
+        # recall と precision が存在する場合のみ追加
+        if "best_recall" in df.columns:
+            agg_dict["mean_best_recall"] = ("best_recall", "mean")
+            agg_dict["std_best_recall"] = ("best_recall", "std")
+        if "last_recall" in df.columns:
+            agg_dict["mean_last_recall"] = ("last_recall", "mean")
+            agg_dict["std_last_recall"] = ("last_recall", "std")
+        if "best_precision" in df.columns:
+            agg_dict["mean_best_precision"] = ("best_precision", "mean")
+            agg_dict["std_best_precision"] = ("best_precision", "std")
+        if "last_precision" in df.columns:
+            agg_dict["mean_last_precision"] = ("last_precision", "mean")
+            agg_dict["std_last_precision"] = ("last_precision", "std")
+        if "last_mAP50-95" in df.columns:
+            agg_dict["mean_last_mAP50_95"] = ("last_mAP50-95", "mean")
+            agg_dict["std_last_mAP50_95"] = ("last_mAP50-95", "std")
+        if "last_mAP50" in df.columns:
+            agg_dict["mean_last_mAP50"] = ("last_mAP50", "mean")
+            agg_dict["std_last_mAP50"] = ("last_mAP50", "std")
+        
+        g = df.groupby(sweep_axes, dropna=False).agg(**agg_dict).reset_index().sort_values(sweep_axes)
         out = out_dir / "summary_by_all_axes.csv"
         g.to_csv(out, index=False)
         print(f"[OK] 保存: {out}")
