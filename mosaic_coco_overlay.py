@@ -16,6 +16,10 @@ New options:
   --gt-color R,G,B        : color for GT (default 255,0,255)
   --gt-line INT           : line width for GT (default 3)
   --gt-alpha INT          : fill alpha for GT (0..255, default 0 no fill)
+  --coco can be specified twice for A/B overlays
+  --ab-iou FLOAT          : overlap IoU threshold (default 0.0, any overlap)
+  --color-a R,G,B         : color for COCO A (default 255,0,0)
+  --color-b R,G,B         : color for COCO B (default 0,128,255)
   --no-overlay            : モザイクのみ保存
 """
 
@@ -88,6 +92,32 @@ def parse_rgb(csv: str, default=(255, 0, 255)):
         return tuple(max(0, min(255, v)) for v in a)
     except Exception:
         return default
+
+def bbox_iou_xywh(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return 0.0
+    ax0, ay0, ax1, ay1 = ax, ay, ax + aw, ay + ah
+    bx0, by0, bx1, by1 = bx, by, bx + bw, by + bh
+    ix0 = max(ax0, bx0)
+    iy0 = max(ay0, by0)
+    ix1 = min(ax1, bx1)
+    iy1 = min(ay1, by1)
+    iw = ix1 - ix0
+    ih = iy1 - iy0
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+def is_overlap(iou, threshold):
+    if threshold <= 0:
+        return iou > 0
+    return iou >= threshold
 
 # ------------------------- XML Parsing ---------------------------
 
@@ -216,7 +246,8 @@ def parse_yolo_obb_line(line: str, tile_w: int, tile_h: int):
 def main():
     ap = argparse.ArgumentParser(description="Merge tiles from XML and overlay COCO bboxes (+ optional GT)")
     ap.add_argument("--xml", '-x', required=True, help="Path to MappingInformation XML")
-    ap.add_argument("--coco", '-j', required=True, help="Path to COCO JSON (AABB)")
+    ap.add_argument("--coco", '-j', action="append", required=True,
+                    help="Path to COCO JSON (AABB). Specify twice for A/B overlays.")
     ap.add_argument("--img-root", '-i', required=True, help="Directory containing tile images")
     ap.add_argument("--out", '-o', required=True, help="Output mosaic image (.png recommended)")
 
@@ -241,6 +272,9 @@ def main():
     s.add_argument("--font-size", type=int, default=16, help="Label font size (after scaling)")
     s.add_argument("--tile-border", action="store_true", help="Draw tile borders for debugging")
     s.add_argument("--tile-label", action="store_true", help="Draw tile (IndexX,IndexY) label")
+    s.add_argument("--ab-iou", type=float, default=0.0, help="Overlap IoU threshold for A/B (default 0.0 = any overlap)")
+    s.add_argument("--color-a", type=str, default="255,0,0", help="COCO A RGB color (default 255,0,0)")
+    s.add_argument("--color-b", type=str, default="0,128,255", help="COCO B RGB color (default 0,128,255)")
 
     # GT overlay
     gt = ap.add_argument_group("GT overlay (YOLO-OBB)")
@@ -271,7 +305,10 @@ def main():
     args = ap.parse_args()
 
     xml_path = Path(args.xml)
-    coco_path = Path(args.coco)
+    coco_paths = [Path(p) for p in (args.coco or [])]
+    if len(coco_paths) > 2:
+        print("[ERROR] --coco can be specified at most twice (A/B).", file=sys.stderr)
+        sys.exit(1)
     img_root = Path(args.img_root)
     out_path = Path(args.out)
 
@@ -280,7 +317,16 @@ def main():
         print("[ERROR] No <Kobetu> entries found in XML.", file=sys.stderr)
         sys.exit(1)
 
-    img_by_id, imgs_by_key, anns_by_img, cat_name = parse_coco(coco_path)
+    coco_sets = []
+    for idx, cpath in enumerate(coco_paths):
+        img_by_id, _, anns_by_img, cat_name = parse_coco(cpath)
+        coco_sets.append({
+            "name": "A" if idx == 0 else "B",
+            "path": cpath,
+            "img_by_id": img_by_id,
+            "anns_by_img": anns_by_img,
+            "cat_name": cat_name,
+        })
 
     # Compute tile absolute positions (pre-shift)
     positions = []  # list of (tile, x, y)
@@ -422,59 +468,101 @@ def main():
         }
 
     if not args.no_overlay:
-        # Draw COCO detections (AABB)
+        # Draw COCO detections (AABB), support A/B
         font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
-        matched = 0
-        skipped = 0
-        for img_id, im in list(img_by_id.items()):
-            key = normalize_key(im.get("file_name", ""))
-            tinfo = tile_info.get(key)
-            if tinfo is None:
-                print(f"[WARN] No tile match for COCO image: file_name='{im.get('file_name')}' (key='{key}')")
-                skipped += 1
-                continue
+        color_a = parse_rgb(args.color_a, default=(255, 0, 0))
+        color_b = parse_rgb(args.color_b, default=(0, 128, 255))
+        color_by_name = {"A": color_a, "B": color_b}
 
-            matched += 1
-            ann_list = anns_by_img.get(img_id, [])
-            if not ann_list:
-                continue
-
-            ox = tinfo["shifted_x"]
-            oy = tinfo["shifted_y"]
-
-            for ann in ann_list:
-                bbox = ann.get("bbox")
-                if not bbox or len(bbox) != 4:
+        def collect_tile_boxes(coco_set):
+            tile_boxes = defaultdict(list)
+            matched = 0
+            skipped = 0
+            for img_id, im in list(coco_set["img_by_id"].items()):
+                key = normalize_key(im.get("file_name", ""))
+                tinfo = tile_info.get(key)
+                if tinfo is None:
+                    print(f"[WARN] No tile match for COCO {coco_set['name']}: file_name='{im.get('file_name')}' (key='{key}')")
+                    skipped += 1
                     continue
-                x, y, w, h = bbox
-                gx0 = (ox + x) * scale
-                gy0 = (oy + y) * scale
-                gx1 = (ox + x + w) * scale
-                gy1 = (oy + y + h) * scale
 
-                cat_id = ann.get("category_id", 0)
-                color = hash_color(cat_id)
-                lw = max(1, int(args.line))
-                if args.alpha > 0:
-                    draw.rectangle([gx0, gy0, gx1, gy1], fill=(color[0], color[1], color[2], int(args.alpha)))
-                draw.rectangle([gx0, gy0, gx1, gy1], outline=(color[0], color[1], color[2], 255), width=lw)
+                matched += 1
+                ann_list = coco_set["anns_by_img"].get(img_id, [])
+                if not ann_list:
+                    continue
 
-                if args.show_label != "none":
-                    if args.show_label == "class_name":
-                        label = cat_name.get(cat_id, str(cat_id))
-                    else:
-                        label = str(cat_id)
-                    try:
-                        l, t, r, b = draw.textbbox((0, 0), label, font=font)
-                        tw, th = (r - l), (b - t)
-                    except Exception:
-                        tw, th = draw.textlength(label, font=font), font.size
-                    bx0, by0 = gx0, gy0 - th - 2
-                    bx1, by1 = gx0 + tw + 4, gy0
-                    draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 160))
-                    draw.text((gx0 + 2, gy0 - th - 1), label, fill=(255, 255, 255, 230), font=font)
+                for ann in ann_list:
+                    bbox = ann.get("bbox")
+                    if not bbox or len(bbox) != 4:
+                        continue
+                    tile_boxes[key].append({"bbox": bbox, "ann": ann, "overlap": False})
+            print(f"[INFO] COCO {coco_set['name']} matched tiles: {matched}, skipped (no tile): {skipped}")
+            return tile_boxes
 
-        print(f"[INFO] Matched COCO images to tiles: {matched}, skipped (no tile): {skipped}")
+        def draw_boxes(tile_boxes, coco_set):
+            color = color_by_name.get(coco_set["name"], color_a)
+            lw = max(1, int(args.line))
+            for key, boxes in tile_boxes.items():
+                tinfo = tile_info.get(key)
+                if tinfo is None:
+                    continue
+                ox = tinfo["shifted_x"]
+                oy = tinfo["shifted_y"]
+                for item in boxes:
+                    x, y, w, h = item["bbox"]
+                    gx0 = (ox + x) * scale
+                    gy0 = (oy + y) * scale
+                    gx1 = (ox + x + w) * scale
+                    gy1 = (oy + y + h) * scale
+                    if args.alpha > 0:
+                        draw.rectangle([gx0, gy0, gx1, gy1], fill=(color[0], color[1], color[2], int(args.alpha)))
+                    draw.rectangle([gx0, gy0, gx1, gy1], outline=(color[0], color[1], color[2], 255), width=lw)
+
+                    if args.show_label != "none":
+                        cat_id = item["ann"].get("category_id", 0)
+                        if args.show_label == "class_name":
+                            label = coco_set["cat_name"].get(cat_id, str(cat_id))
+                        else:
+                            label = str(cat_id)
+                        try:
+                            l, t, r, b = draw.textbbox((0, 0), label, font=font)
+                            tw, th = (r - l), (b - t)
+                        except Exception:
+                            tw, th = draw.textlength(label, font=font), font.size
+                        bx0, by0 = gx0, gy0 - th - 2
+                        bx1, by1 = gx0 + tw + 4, gy0
+                        draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 160))
+                        draw.text((gx0 + 2, gy0 - th - 1), label, fill=(255, 255, 255, 230), font=font)
+
+        tile_boxes_a = None
+        tile_boxes_b = None
+        if len(coco_sets) >= 1:
+            tile_boxes_a = collect_tile_boxes(coco_sets[0])
+        if len(coco_sets) >= 2:
+            tile_boxes_b = collect_tile_boxes(coco_sets[1])
+
+        if tile_boxes_a is not None and tile_boxes_b is not None:
+            overlap_a = 0
+            overlap_b = 0
+            for key in set(tile_boxes_a.keys()) | set(tile_boxes_b.keys()):
+                boxes_a = tile_boxes_a.get(key, [])
+                boxes_b = tile_boxes_b.get(key, [])
+                for a in boxes_a:
+                    for b in boxes_b:
+                        iou = bbox_iou_xywh(a["bbox"], b["bbox"])
+                        if is_overlap(iou, args.ab_iou):
+                            if not a["overlap"]:
+                                a["overlap"] = True
+                                overlap_a += 1
+                            if not b["overlap"]:
+                                b["overlap"] = True
+                                overlap_b += 1
+            print(f"[INFO] Overlap (IoU>={args.ab_iou:g}): A={overlap_a}, B={overlap_b}")
+
+        if tile_boxes_a is not None:
+            draw_boxes(tile_boxes_a, coco_sets[0])
+        if tile_boxes_b is not None:
+            draw_boxes(tile_boxes_b, coco_sets[1])
 
         # --------------------- GT overlay (optional) ---------------------
         if args.gt_dir:
