@@ -28,6 +28,69 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 # ---------------------- IO helpers ----------------------
 
+def parse_conf_list(conf_str: str) -> list[float]:
+    if conf_str is None:
+        return [0.25]
+    if isinstance(conf_str, (int, float)):
+        return [float(conf_str)]
+    parts = [p.strip() for p in str(conf_str).split(",") if p.strip()]
+    if not parts:
+        return [0.25]
+    confs = []
+    for p in parts:
+        confs.append(float(p))
+    return confs
+
+def extract_recall_overall(metrics: dict) -> Optional[float]:
+    for k, v in metrics.items():
+        if k.startswith("recall_overall"):
+            try:
+                return float(v)
+            except Exception:
+                return None
+    return None
+
+def print_conf_summary(rows: list[dict]):
+    headers = [
+        "conf",
+        "tta_mAP50",
+        "tta_mAP50_95",
+        "tta_recall",
+        "val_mAP50",
+        "val_mAP50_95",
+        "val_precision",
+        "val_recall",
+    ]
+    def _fmt(v: Optional[float]) -> str:
+        return "-" if v is None else f"{v:.4f}"
+
+    str_rows = []
+    for r in rows:
+        str_rows.append({
+            "conf": f"{float(r['conf']):.4f}",
+            "tta_mAP50": _fmt(r.get("tta_mAP50")),
+            "tta_mAP50_95": _fmt(r.get("tta_mAP50_95")),
+            "tta_recall": _fmt(r.get("tta_recall")),
+            "val_mAP50": _fmt(r.get("val_mAP50")),
+            "val_mAP50_95": _fmt(r.get("val_mAP50_95")),
+            "val_precision": _fmt(r.get("val_precision")),
+            "val_recall": _fmt(r.get("val_recall")),
+        })
+
+    widths = {h: len(h) for h in headers}
+    for r in str_rows:
+        for h in headers:
+            widths[h] = max(widths[h], len(str(r[h])))
+
+    header_line = "  ".join(h.ljust(widths[h]) for h in headers)
+    sep_line = "  ".join("-" * widths[h] for h in headers)
+    print("\n[CONF SUMMARY]")
+    print(header_line)
+    print(sep_line)
+    for r in str_rows:
+        line = "  ".join(str(r[h]).ljust(widths[h]) for h in headers)
+        print(line)
+
 def load_yaml(p: Path):
     with open(p, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -545,7 +608,7 @@ def main():
     ap.add_argument("--weights", '-w', required=True, help="path to best.pt")
     ap.add_argument("--out", '-o', required=True, help="output directory")
     ap.add_argument("--split", default="test", choices=["test", "val", "train"], help="which split")
-    ap.add_argument("--conf", type=float, default=0.25, help="confidence threshold for predictions")
+    ap.add_argument("--conf", type=str, default="0.25", help="confidence threshold(s) for predictions (comma-separated)")
     ap.add_argument("--iou", type=float, default=0.70, help="NMS IoU threshold (per-call)")
     ap.add_argument("--angle_unit", choices=["deg", "rad"], default="deg", help="GT angle unit")
     ap.add_argument("--thick", type=int, default=4, help="line thickness for overlay")
@@ -628,198 +691,239 @@ def main():
         except Exception:
             pass  # Ultralytics handles device generally via predict/val args
 
-    # ---------- Overlays ----------
-    if not args.skip_vis:
-        img_paths = find_images(test_entry)
-        if args.max_images and args.max_images > 0:
-            img_paths = img_paths[: args.max_images]
-        assert img_paths, f"No images found under '{test_entry}'"
-        tta_records = []  # 各画像の GT/PRED を蓄積して後でmAP計算
+    conf_list = parse_conf_list(args.conf)
+    summaries = []
 
-        for i, img_path in enumerate(img_paths, 1):
-            img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
-            if img is None:
-                print(f"[WARN] Failed to read image: {img_path}")
-                continue
-            H, W = img.shape[:2]
-            canvas = as_bgr(img.copy())
+    def run_eval_for_conf(conf: float) -> dict:
+        summary = {
+            "conf": conf,
+            "tta_mAP50": None,
+            "tta_mAP50_95": None,
+            "tta_recall": None,
+            "val_mAP50": None,
+            "val_mAP50_95": None,
+            "val_precision": None,
+            "val_recall": None,
+        }
 
-            # GT
-            gt_items = []
-            lbl_path = map_image_to_label(img_path)
-            if lbl_path:
-                for poly, cls in load_gt_polys_auto(lbl_path, W, H):
-                    txt = f"GT:{class_names.get(cls, str(cls))}" if class_names else None
-                    draw_poly(canvas, poly, C_GT, thick, label=txt)
-                    gt_items.append({"cls": int(cls), "poly": poly.astype(np.float32)})
+        # ---------- Overlays ----------
+        if not args.skip_vis:
+            img_paths = find_images(test_entry)
+            if args.max_images and args.max_images > 0:
+                img_paths = img_paths[: args.max_images]
+            assert img_paths, f"No images found under '{test_entry}'"
+            tta_records = []  # 各画像の GT/PRED を蓄積して後でmAP計算
 
-            # Predictions
-            if args.tta != "none":
-                # 既存のTTAマージ
-                polys, pred_classes, pred_confs, _xywhr = predict_obb_with_tta(
-                    model=model, img_bgr=as_bgr(img), conf=args.conf, iou=args.iou,
-                    imgsz=imgsz, tta_mode=args.tta, tta_merge_iou=args.tta_merge_iou
-                )
-                pred_legend = "Pred (TTA)"
-            else:
-                # TTAがnoneのときだけ SAHI のスライス推論を試す
-                sahi_polys, sahi_classes, sahi_confs = predict_obb_with_sahi_if_enabled(
-                    use_sahi=args.use_sahi_slice,
-                    weights_path=args.weights,
-                    img_bgr=as_bgr(img),
-                    conf=args.conf,
-                    device=args.device,
-                    slice_w=args.slice_width,
-                    slice_h=args.slice_height,
-                    ovw=args.overlap_width_ratio,
-                    ovh=args.overlap_height_ratio,
-                    postprocess_type=args.sahi_postprocess,
-                )
-
-                if sahi_polys is not None:
-                    polys, pred_classes, pred_confs = sahi_polys, sahi_classes, sahi_confs
-                    _xywhr = None
-                    pred_legend = "Pred (SAHI)"
-                else:
-                    # SAHIが無効/失敗 → 通常の単画像推論（TTAなし）
-                    res = model.predict(
-                        source=as_bgr(img),
-                        conf=args.conf,
-                        iou=args.iou,
-                        imgsz=imgsz,
-                        verbose=False,
-                        device=args.device if args.device is not None else None,
-                    )
-                    # Ultralytics OBB → polygon へ（あなたの tta_obb.py の obb_to_polygon 等が流用できるならそれでもOK）
-                    polys, pred_classes, pred_confs = [], [], []
-                    for r in (res or []):
-                        # r.obb または r.boxes.rbox など、環境によって保持場所が異なるのでいくつか試す
-                        obb = getattr(r, "obb", None) or getattr(getattr(r, "boxes", None), "rbox", None)
-                        if obb is not None and hasattr(obb, "xywhr"):
-                            xywhr = obb.xywhr.cpu().numpy()
-                            confs = getattr(obb, "conf", getattr(getattr(r, "boxes", None), "conf", None))
-                            confs = confs.cpu().numpy() if confs is not None else np.ones(len(xywhr), dtype=np.float32)
-                            clsids = getattr(obb, "cls", getattr(getattr(r, "boxes", None), "cls", None))
-                            clsids = clsids.cpu().numpy().astype(int) if clsids is not None else np.zeros(len(xywhr), dtype=int)
-                            for (cx,cy,w,h,ang), c, sc in zip(xywhr, clsids, confs):
-                                poly = obb_to_polygon(float(cx), float(cy), float(w), float(h), float(np.degrees(ang)))
-                                polys.append(poly.astype(np.float32))
-                                pred_classes.append(int(c))
-                                pred_confs.append(float(sc))
-                        else:
-                            # AABBのみ → AABBを四角形に
-                            boxes = getattr(r, "boxes", None)
-                            if boxes is None:
-                                continue
-                            xyxy = getattr(boxes, "xyxy", None)
-                            clsids = getattr(boxes, "cls", None)
-                            confs = getattr(boxes, "conf", None)
-                            if xyxy is None:
-                                continue
-                            xyxy = xyxy.cpu().numpy()
-                            clsids = clsids.cpu().numpy().astype(int) if clsids is not None else np.zeros(len(xyxy), dtype=int)
-                            confs = confs.cpu().numpy() if confs is not None else np.ones(len(xyxy), dtype=np.float32)
-                            for (x1,y1,x2,y2), c, sc in zip(xyxy, clsids, confs):
-                                poly = np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float32)
-                                polys.append(poly)
-                                pred_classes.append(int(c))
-                                pred_confs.append(float(sc))
-                    pred_legend = "Pred"
-
-            # Draw
-            for poly, cls, conf in zip(polys, pred_classes, pred_confs):
-                if class_names is not None and cls is not None and cls >= 0:
-                    name = class_names.get(int(cls), str(int(cls)))
-                    txt = f"PR:{name}"
-                else:
-                    txt = "PR"
-                if conf is not None:
-                    txt = f"{txt} {conf:.2f}"
-                draw_poly(canvas, poly, C_PR, thick, label=txt)
-
-            # legend
-            y0 = 30
-            cv2.putText(canvas, "GT", (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_GT, 2, cv2.LINE_AA)
-            cv2.line(canvas, (60, y0-8), (120, y0-8), C_GT, thick, cv2.LINE_AA)
-            cv2.putText(canvas, pred_legend, (140, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_PR, 2, cv2.LINE_AA)
-            cv2.line(canvas, (270, y0-8), (430, y0-8), C_PR, thick, cv2.LINE_AA)
-
-            out_path = out_dir / f"{img_path.stem}_gt_pred.png"
-            cv2.imwrite(str(out_path), canvas)
-            print(f"[{i}/{len(img_paths)}] saved -> {out_path}")
-
-            pred_items = []
-            for poly, cls, conf in zip(polys, pred_classes, pred_confs):
-                if cls is None or cls < 0:
+            for i, img_path in enumerate(img_paths, 1):
+                img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    print(f"[WARN] Failed to read image: {img_path}")
                     continue
-                pred_items.append({"cls": int(cls), "conf": float(conf), "poly": poly.astype(np.float32)})
+                H, W = img.shape[:2]
+                canvas = as_bgr(img.copy())
 
-            tta_records.append({
-                "image_id": str(img_path),
-                "gt": gt_items,
-                "pred": pred_items,
-            })
+                # GT
+                gt_items = []
+                lbl_path = map_image_to_label(img_path)
+                if lbl_path:
+                    for poly, cls in load_gt_polys_auto(lbl_path, W, H):
+                        txt = f"GT:{class_names.get(cls, str(cls))}" if class_names else None
+                        draw_poly(canvas, poly, C_GT, thick, label=txt)
+                        gt_items.append({"cls": int(cls), "poly": poly.astype(np.float32)})
 
-        print("\n[TTA EVAL] Computing TTA-based metrics (mAP@0.50 and mAP@0.50:0.95) ...")
-        tta_metrics = eval_tta_detections(tta_records, class_names, iou_thrs=map_iou_thrs, iou_mode=args.eval_iou_mode, conf_thresh=args.conf, recall_iou=args.recall_iou)
+                # Predictions
+                if args.tta != "none":
+                    # 既存のTTAマージ
+                    polys, pred_classes, pred_confs, _xywhr = predict_obb_with_tta(
+                        model=model, img_bgr=as_bgr(img), conf=conf, iou=args.iou,
+                        imgsz=imgsz, tta_mode=args.tta, tta_merge_iou=args.tta_merge_iou
+                    )
+                    pred_legend = "Pred (TTA)"
+                else:
+                    # TTAがnoneのときだけ SAHI のスライス推論を試す
+                    sahi_polys, sahi_classes, sahi_confs = predict_obb_with_sahi_if_enabled(
+                        use_sahi=args.use_sahi_slice,
+                        weights_path=args.weights,
+                        img_bgr=as_bgr(img),
+                        conf=conf,
+                        device=args.device,
+                        slice_w=args.slice_width,
+                        slice_h=args.slice_height,
+                        ovw=args.overlap_width_ratio,
+                        ovh=args.overlap_height_ratio,
+                        postprocess_type=args.sahi_postprocess,
+                    )
 
-        # 保存
-        tta_json = metrics_dir / "metrics_tta_summary.json"
-        with open(tta_json, "w", encoding="utf-8") as f:
-            json.dump(tta_metrics, f, indent=2, ensure_ascii=False)
+                    if sahi_polys is not None:
+                        polys, pred_classes, pred_confs = sahi_polys, sahi_classes, sahi_confs
+                        _xywhr = None
+                        pred_legend = "Pred (SAHI)"
+                    else:
+                        # SAHIが無効/失敗 → 通常の単画像推論（TTAなし）
+                        res = model.predict(
+                            source=as_bgr(img),
+                            conf=conf,
+                            iou=args.iou,
+                            imgsz=imgsz,
+                            verbose=False,
+                            device=args.device if args.device is not None else None,
+                        )
+                        # Ultralytics OBB → polygon へ（あなたの tta_obb.py の obb_to_polygon 等が流用できるならそれでもOK）
+                        polys, pred_classes, pred_confs = [], [], []
+                        for r in (res or []):
+                            # r.obb または r.boxes.rbox など、環境によって保持場所が異なるのでいくつか試す
+                            obb = getattr(r, "obb", None) or getattr(getattr(r, "boxes", None), "rbox", None)
+                            if obb is not None and hasattr(obb, "xywhr"):
+                                xywhr = obb.xywhr.cpu().numpy()
+                                confs = getattr(obb, "conf", getattr(getattr(r, "boxes", None), "conf", None))
+                                confs = confs.cpu().numpy() if confs is not None else np.ones(len(xywhr), dtype=np.float32)
+                                clsids = getattr(obb, "cls", getattr(getattr(r, "boxes", None), "cls", None))
+                                clsids = clsids.cpu().numpy().astype(int) if clsids is not None else np.zeros(len(xywhr), dtype=int)
+                                for (cx,cy,w,h,ang), c, sc in zip(xywhr, clsids, confs):
+                                    poly = obb_to_polygon(float(cx), float(cy), float(w), float(h), float(np.degrees(ang)))
+                                    polys.append(poly.astype(np.float32))
+                                    pred_classes.append(int(c))
+                                    pred_confs.append(float(sc))
+                            else:
+                                # AABBのみ → AABBを四角形に
+                                boxes = getattr(r, "boxes", None)
+                                if boxes is None:
+                                    continue
+                                xyxy = getattr(boxes, "xyxy", None)
+                                clsids = getattr(boxes, "cls", None)
+                                confs = getattr(boxes, "conf", None)
+                                if xyxy is None:
+                                    continue
+                                xyxy = xyxy.cpu().numpy()
+                                clsids = clsids.cpu().numpy().astype(int) if clsids is not None else np.zeros(len(xyxy), dtype=int)
+                                confs = confs.cpu().numpy() if confs is not None else np.ones(len(xyxy), dtype=np.float32)
+                                for (x1,y1,x2,y2), c, sc in zip(xyxy, clsids, confs):
+                                    poly = np.array([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], dtype=np.float32)
+                                    polys.append(poly)
+                                    pred_classes.append(int(c))
+                                    pred_confs.append(float(sc))
+                        pred_legend = "Pred"
 
-        # CSV（トップラインのみ）
-        tta_csv = metrics_dir / "metrics_tta_summary.csv"
-        with open(tta_csv, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["metric", "value"])
-            w.writerow(["mAP50", tta_metrics["mAP50"]])
-            w.writerow(["mAP50_95", tta_metrics["mAP50_95"]])
-            w.writerow(["num_images", tta_metrics["num_images"]])
-            w.writerow(["num_classes", tta_metrics["num_classes"]])
+                # Draw
+                for poly, cls, pred_conf in zip(polys, pred_classes, pred_confs):
+                    if class_names is not None and cls is not None and cls >= 0:
+                        name = class_names.get(int(cls), str(int(cls)))
+                        txt = f"PR:{name}"
+                    else:
+                        txt = "PR"
+                    if pred_conf is not None:
+                        txt = f"{txt} {pred_conf:.2f}"
+                    draw_poly(canvas, poly, C_PR, thick, label=txt)
+
+                # legend
+                y0 = 30
+                cv2.putText(canvas, "GT", (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_GT, 2, cv2.LINE_AA)
+                cv2.line(canvas, (60, y0-8), (120, y0-8), C_GT, thick, cv2.LINE_AA)
+                cv2.putText(canvas, pred_legend, (140, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_PR, 2, cv2.LINE_AA)
+                cv2.line(canvas, (270, y0-8), (430, y0-8), C_PR, thick, cv2.LINE_AA)
+
+                out_path = out_dir / f"{img_path.stem}_gt_pred.png"
+                cv2.imwrite(str(out_path), canvas)
+                print(f"[{i}/{len(img_paths)}] saved -> {out_path}")
+
+                pred_items = []
+                for poly, cls, pred_conf in zip(polys, pred_classes, pred_confs):
+                    if cls is None or cls < 0:
+                        continue
+                    pred_items.append({"cls": int(cls), "conf": float(pred_conf), "poly": poly.astype(np.float32)})
+
+                tta_records.append({
+                    "image_id": str(img_path),
+                    "gt": gt_items,
+                    "pred": pred_items,
+                })
+
+            print("\n[TTA EVAL] Computing TTA-based metrics (mAP@0.50 and mAP@0.50:0.95) ...")
+            tta_metrics = eval_tta_detections(
+                tta_records,
+                class_names,
+                iou_thrs=map_iou_thrs,
+                iou_mode=args.eval_iou_mode,
+                conf_thresh=conf,
+                recall_iou=args.recall_iou,
+            )
+            summary["tta_mAP50"] = tta_metrics.get("mAP50")
+            summary["tta_mAP50_95"] = tta_metrics.get("mAP50_95")
+            summary["tta_recall"] = extract_recall_overall(tta_metrics)
+
+            # 保存
+            tta_json = metrics_dir / "metrics_tta_summary.json"
+            with open(tta_json, "w", encoding="utf-8") as f:
+                json.dump(tta_metrics, f, indent=2, ensure_ascii=False)
+
+            # CSV（トップラインのみ）
+            tta_csv = metrics_dir / "metrics_tta_summary.csv"
+            with open(tta_csv, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["metric", "value"])
+                w.writerow(["mAP50", tta_metrics["mAP50"]])
+                w.writerow(["mAP50_95", tta_metrics["mAP50_95"]])
+                w.writerow(["num_images", tta_metrics["num_images"]])
+                w.writerow(["num_classes", tta_metrics["num_classes"]])
+                for k in tta_metrics.keys():
+                    if k.startswith("recall_overall"):
+                        w.writerow([k, tta_metrics[k]])
+
+            print(f"[TTA EVAL] mAP50={tta_metrics['mAP50']:.4f}  mAP50_95={tta_metrics['mAP50_95']:.4f}")
+            print(f"[TTA EVAL] Saved: {tta_json}")
             for k in tta_metrics.keys():
                 if k.startswith("recall_overall"):
-                    w.writerow([k, tta_metrics[k]])
+                    print(f"[TTA EVAL] {k}={tta_metrics[k]:.4f}")
 
-        print(f"[TTA EVAL] mAP50={tta_metrics['mAP50']:.4f}  mAP50_95={tta_metrics['mAP50_95']:.4f}")
-        print(f"[TTA EVAL] Saved: {tta_json}")
-        for k in tta_metrics.keys():
-            if k.startswith("recall_overall"):
-                print(f"[TTA EVAL] {k}={tta_metrics[k]:.4f}")
+        # ---------- Metrics via Ultralytics val ----------
+        print("\n[VAL] Running Ultralytics validation to compute metrics (no TTA) ...")
+        val_ret = model.val(
+            data=str(data_yaml),
+            split=split_key,
+            conf=conf,
+            iou=args.iou,
+            save_json=True,
+            plots=True,
+            project=str(metrics_dir),
+            name=".",
+            imgsz=imgsz,
+            verbose=False,
+        )
 
-    # ---------- Metrics via Ultralytics val ----------
-    print("\n[VAL] Running Ultralytics validation to compute metrics (no TTA) ...")
-    val_ret = model.val(
-        data=str(data_yaml),
-        split=split_key,
-        conf=args.conf,
-        iou=args.iou,
-        save_json=True,
-        plots=True,
-        project=str(metrics_dir),
-        name=".",
-        imgsz=imgsz,
-        verbose=False,
-    )
+        metrics = try_collect_metrics_from_api(val_ret) or try_collect_metrics_from_csv(metrics_dir)
 
-    metrics = try_collect_metrics_from_api(val_ret) or try_collect_metrics_from_csv(metrics_dir)
+        sum_csv = metrics_dir / "metrics_summary.csv"
+        sum_json = metrics_dir / "metrics_summary.json"
+        if metrics:
+            with open(sum_csv, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f); w.writerow(["metric", "value"])
+                for k, v in metrics.items():
+                    w.writerow([k, v])
+            with open(sum_json, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2, ensure_ascii=False)
+            print(f"[VAL] Summary saved: {sum_csv}")
+        else:
+            print("[VAL] Warning: could not parse metrics automatically (check Ultralytics CSV/JSON).")
 
-    sum_csv = metrics_dir / "metrics_summary.csv"
-    sum_json = metrics_dir / "metrics_summary.json"
-    if metrics:
-        with open(sum_csv, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f); w.writerow(["metric", "value"])
-            for k, v in metrics.items():
-                w.writerow([k, v])
-        with open(sum_json, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2, ensure_ascii=False)
-        print(f"[VAL] Summary saved: {sum_csv}")
-    else:
-        print("[VAL] Warning: could not parse metrics automatically (check Ultralytics CSV/JSON).")
+        harvest_val_artifacts(metrics_dir, metrics_dir)
+        print("[DONE] Visuals in:", out_dir)
+        print("[DONE] Metrics in:", metrics_dir)
 
-    harvest_val_artifacts(metrics_dir, metrics_dir)
-    print("[DONE] Visuals in:", out_dir)
-    print("[DONE] Metrics in:", metrics_dir)
+        if metrics:
+            summary["val_mAP50"] = metrics.get("mAP50")
+            summary["val_mAP50_95"] = metrics.get("mAP50_95")
+            summary["val_precision"] = metrics.get("precision")
+            summary["val_recall"] = metrics.get("recall")
+
+        return summary
+
+    for conf in conf_list:
+        if len(conf_list) > 1:
+            print(f"\n[CONF] conf={conf}")
+        summaries.append(run_eval_for_conf(conf))
+
+    if len(conf_list) > 1:
+        print_conf_summary(summaries)
 
 if __name__ == "__main__":
     main()
