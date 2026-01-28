@@ -91,6 +91,122 @@ def print_conf_summary(rows: list[dict]):
         line = "  ".join(str(r[h]).ljust(widths[h]) for h in headers)
         print(line)
 
+def poly_area(poly: np.ndarray) -> float:
+    """Polygon area (shoelace). poly: (N,2)."""
+    if poly is None:
+        return 0.0
+    pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 3:
+        return 0.0
+    x = pts[:, 0]; y = pts[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+def poly_to_coco_segmentation(poly: np.ndarray) -> list[list[float]]:
+    pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
+    flat = pts.reshape(-1).tolist()
+    return [flat]
+
+def poly_to_coco_bbox_xywh(poly: np.ndarray) -> list[float]:
+    pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
+    x1, y1 = np.min(pts, axis=0)
+    x2, y2 = np.max(pts, axis=0)
+    return [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+
+def conf_to_tag(conf: float) -> str:
+    # 0.1 -> "0p10" (avoid dot in filenames)
+    s = f"{conf:.4f}".rstrip("0").rstrip(".")
+    return s.replace(".", "p")
+
+def write_tta_cocojson(
+    tta_records: list[dict],
+    out_dir: Path,
+    class_names: dict | None,
+    conf: float,
+):
+    """
+    Save GT as COCO dataset JSON and predictions as COCO results JSON (list of detections).
+    - GT: images/categories/annotations
+    - Pred: list[{image_id, category_id, segmentation, bbox, score}]
+    """
+    # image_id mapping to int
+    img_ids = {}
+    images = []
+    for idx, r in enumerate(tta_records, 1):
+        key = r["image_id"]
+        img_ids[key] = idx
+        images.append({
+            "id": idx,
+            "file_name": str(key),
+            "width": int(r.get("width", 0) or 0),
+            "height": int(r.get("height", 0) or 0),
+        })
+
+    # categories
+    if class_names:
+        cat_ids = sorted(int(k) for k in class_names.keys())
+        categories = [{"id": int(cid), "name": str(class_names.get(cid, cid))} for cid in cat_ids]
+    else:
+        s = set()
+        for r in tta_records:
+            for g in r.get("gt", []):
+                s.add(int(g["cls"]))
+            for p in r.get("pred", []):
+                s.add(int(p["cls"]))
+        cat_ids = sorted(int(c) for c in s if c is not None and int(c) >= 0)
+        categories = [{"id": int(cid), "name": str(cid)} for cid in cat_ids]
+
+    # GT annotations
+    ann_id = 1
+    annotations = []
+    for r in tta_records:
+        im_id = img_ids[r["image_id"]]
+        for g in r.get("gt", []):
+            cid = int(g["cls"])
+            poly = np.asarray(g["poly"], dtype=np.float32)
+            annotations.append({
+                "id": ann_id,
+                "image_id": int(im_id),
+                "category_id": int(cid),
+                "segmentation": poly_to_coco_segmentation(poly),
+                "bbox": poly_to_coco_bbox_xywh(poly),
+                "area": poly_area(poly),
+                "iscrowd": 0,
+            })
+            ann_id += 1
+
+    # Predictions (COCO results)
+    detections = []
+    for r in tta_records:
+        im_id = img_ids[r["image_id"]]
+        for p in r.get("pred", []):
+            cid = int(p["cls"])
+            score = float(p.get("conf", 0.0))
+            poly = np.asarray(p["poly"], dtype=np.float32)
+            detections.append({
+                "image_id": int(im_id),
+                "category_id": int(cid),
+                "segmentation": poly_to_coco_segmentation(poly),
+                "bbox": poly_to_coco_bbox_xywh(poly),
+                "score": score,
+            })
+
+    tag = conf_to_tag(conf)
+    gt_path = out_dir / f"tta_gt_conf{tag}.coco.json"
+    pred_path = out_dir / f"tta_pred_conf{tag}.coco.json"
+
+    gt = {
+        "images": images,
+        "annotations": annotations,
+        "categories": categories,
+    }
+    with open(gt_path, "w", encoding="utf-8") as f:
+        json.dump(gt, f, indent=2, ensure_ascii=False)
+    with open(pred_path, "w", encoding="utf-8") as f:
+        json.dump(detections, f, indent=2, ensure_ascii=False)
+
+    print(f"[TTA COCOJSON] Saved GT:   {gt_path}")
+    print(f"[TTA COCOJSON] Saved Pred: {pred_path}")
+
 def load_yaml(p: Path):
     with open(p, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -834,6 +950,8 @@ def main():
 
                 tta_records.append({
                     "image_id": str(img_path),
+                    "width": int(W),
+                    "height": int(H),
                     "gt": gt_items,
                     "pred": pred_items,
                 })
@@ -850,6 +968,14 @@ def main():
             summary["tta_mAP50"] = tta_metrics.get("mAP50")
             summary["tta_mAP50_95"] = tta_metrics.get("mAP50_95")
             summary["tta_recall"] = extract_recall_overall(tta_metrics)
+
+            # COCOJSON export (GT + predictions)
+            write_tta_cocojson(
+                tta_records=tta_records,
+                out_dir=metrics_dir,
+                class_names=class_names,
+                conf=conf,
+            )
 
             # 保存
             tta_json = metrics_dir / "metrics_tta_summary.json"
