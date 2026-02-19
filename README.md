@@ -71,5 +71,5 @@ Direct file pages:
 Please cite:
 
 A visualization framework for cell division activity and orientation in pre-anthesis ovaries of *Prunus* species.  
-Ayame Shimbo, Soichiro Nishiyama, Tatsuya Katsuno, Akane Kusumi, Hisayo Yamane, Masahiro M. Kanaoka, and Ryutaro Tao.  
-In preparation.
+Ayame Shimbo, Soichiro Nishiyama, Tatsuya Katsuno, Akane Kusumi, Hisayo Yamane, Masahiro M Kanaoka, and Ryutaro Tao.  
+bioRxiv 2026.02.16.706041; doi: https://doi.org/10.64898/2026.02.16.706041
