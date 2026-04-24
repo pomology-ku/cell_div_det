@@ -57,6 +57,8 @@ SCAN_KEYS = [
     "iou", "conf", "agnostic_nms", "augment",
     # 学習率系（変えてたら拾う）
     "lr0", "lrf", "cos_lr", "momentum", "weight_decay",
+    # fine-tune系
+    "freeze",
     # focal loss系
     "fl_gamma", "fl_alpha",
 ]
@@ -69,6 +71,8 @@ ALIASES = {
 NAME_PATTERNS = [
     re.compile(r".*_(?P<model>yolo\d+[nslmx]-obb).*_i(?P<imgsz>\d+)", re.IGNORECASE),
     re.compile(r"fold(?P<fold>\d+)[_\-]+(?P<model>[^_]+)[_\-]+e(?P<epochs>\d+)[_\-]+i(?P<imgsz>\d+)", re.IGNORECASE),
+    re.compile(r".*_freeze(?P<freeze>\d+)", re.IGNORECASE),
+    re.compile(r".*_lr0(?P<lr0>\d+(?:\.\d+)?)", re.IGNORECASE),
     re.compile(r".*_fl[_-]?alpha(?P<fl_alpha>\d+(?:\.\d+)?)", re.IGNORECASE),
     re.compile(r".*_fl[_-]?gamma(?P<fl_gamma>\d+(?:\.\d+)?)", re.IGNORECASE),
 ]
@@ -206,7 +210,7 @@ def get_last_epoch_metrics(df: pd.DataFrame) -> dict:
     return out
 
 def parse_name_fallback(name: str) -> dict:
-    info = {"model": None, "imgsz": None, "fl_alpha": None, "fl_gamma": None}
+    info = {"model": None, "imgsz": None, "lr0": None, "freeze": None, "fl_alpha": None, "fl_gamma": None}
     for pat in NAME_PATTERNS:
         m = pat.match(name)
         if m:
@@ -214,6 +218,12 @@ def parse_name_fallback(name: str) -> dict:
             if gd.get("model"): info["model"] = gd["model"]
             if gd.get("imgsz"):
                 try: info["imgsz"] = int(gd["imgsz"])
+                except: pass
+            if gd.get("lr0"):
+                try: info["lr0"] = float(gd["lr0"])
+                except: pass
+            if gd.get("freeze"):
+                try: info["freeze"] = int(gd["freeze"])
                 except: pass
             if gd.get("fl_alpha"):
                 try: info["fl_alpha"] = float(gd["fl_alpha"])
@@ -285,7 +295,7 @@ def load_run_axes(run_dir: Path) -> dict:
 
     # フォールバック（run名から）
     fb = parse_name_fallback(run_dir.name)
-    for k in ("model", "imgsz", "fl_alpha", "fl_gamma"):
+    for k in ("model", "imgsz", "lr0", "freeze", "fl_alpha", "fl_gamma"):
         if (k not in out) or (out[k] in (None, "")):
             if fb.get(k) not in (None, ""):
                 out[k] = fb[k]
