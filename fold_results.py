@@ -335,6 +335,8 @@ def main():
     ap.add_argument("--name_prefix", "-n", default="", help="対象runの名前プレフィックス（空なら全件）")
     ap.add_argument("--discover_all", action="store_true",
                     help="train.yamlに無いキーでも、runを走査して値が2種類以上あれば自動軸として加える")
+    ap.add_argument("--no_last_metrics", '-l', action="store_true",
+                    help="last_epoch / last_mAP / last_recall / last_precision 列を出力しない")
     args = ap.parse_args()
 
     project = Path(args.project)
@@ -459,6 +461,7 @@ def main():
 
     # スコア列（mAP50-95優先、無ければmAP50）
     df["score_for_group"] = df["best_mAP50-95"].fillna(df["best_mAP50"])
+    include_last_metrics = not args.no_last_metrics
 
     # ==== 4) 軸ごとの自動集計（単軸） ====
     for ax in sweep_axes:
@@ -466,8 +469,6 @@ def main():
             continue
         agg_dict = {
             "n": ("score_for_group", "count"),
-            "mean": ("score_for_group", "mean"),
-            "std": ("score_for_group", "std"),
             "mean_mAP50_95": ("best_mAP50-95", "mean"),
             "std_mAP50_95": ("best_mAP50-95", "std"),
             "mean_mAP50": ("best_mAP50", "mean"),
@@ -483,15 +484,18 @@ def main():
         if "best_precision" in df.columns:
             agg_dict["mean_best_precision"] = ("best_precision", "mean")
             agg_dict["std_best_precision"] = ("best_precision", "std")
-        if "last_precision" in df.columns:
+        if include_last_metrics and "last_precision" in df.columns:
             agg_dict["mean_last_precision"] = ("last_precision", "mean")
             agg_dict["std_last_precision"] = ("last_precision", "std")
-        if "last_mAP50-95" in df.columns:
+        if include_last_metrics and "last_mAP50-95" in df.columns:
             agg_dict["mean_last_mAP50_95"] = ("last_mAP50-95", "mean")
             agg_dict["std_last_mAP50_95"] = ("last_mAP50-95", "std")
-        if "last_mAP50" in df.columns:
+        if include_last_metrics and "last_mAP50" in df.columns:
             agg_dict["mean_last_mAP50"] = ("last_mAP50", "mean")
             agg_dict["std_last_mAP50"] = ("last_mAP50", "std")
+        if include_last_metrics and "last_recall" in df.columns:
+            agg_dict["mean_last_recall"] = ("last_recall", "mean")
+            agg_dict["std_last_recall"] = ("last_recall", "std")
         
         g = df.groupby(ax, dropna=False).agg(**agg_dict).reset_index().sort_values(ax)
         out = out_dir / f"summary_by_{ax}.csv"
@@ -502,8 +506,6 @@ def main():
     if len(sweep_axes) >= 2 and all(ax in df.columns for ax in sweep_axes):
         agg_dict = {
             "n": ("score_for_group", "count"),
-            "mean": ("score_for_group", "mean"),
-            "std": ("score_for_group", "std"),
             "mean_mAP50_95": ("best_mAP50-95", "mean"),
             "std_mAP50_95": ("best_mAP50-95", "std"),
             "mean_mAP50": ("best_mAP50", "mean"),
@@ -519,15 +521,18 @@ def main():
         if "best_precision" in df.columns:
             agg_dict["mean_best_precision"] = ("best_precision", "mean")
             agg_dict["std_best_precision"] = ("best_precision", "std")
-        if "last_precision" in df.columns:
+        if include_last_metrics and "last_precision" in df.columns:
             agg_dict["mean_last_precision"] = ("last_precision", "mean")
             agg_dict["std_last_precision"] = ("last_precision", "std")
-        if "last_mAP50-95" in df.columns:
+        if include_last_metrics and "last_mAP50-95" in df.columns:
             agg_dict["mean_last_mAP50_95"] = ("last_mAP50-95", "mean")
             agg_dict["std_last_mAP50_95"] = ("last_mAP50-95", "std")
-        if "last_mAP50" in df.columns:
+        if include_last_metrics and "last_mAP50" in df.columns:
             agg_dict["mean_last_mAP50"] = ("last_mAP50", "mean")
             agg_dict["std_last_mAP50"] = ("last_mAP50", "std")
+        if include_last_metrics and "last_recall" in df.columns:
+            agg_dict["mean_last_recall"] = ("last_recall", "mean")
+            agg_dict["std_last_recall"] = ("last_recall", "std")
         
         g = df.groupby(sweep_axes, dropna=False).agg(**agg_dict).reset_index().sort_values(sweep_axes)
         out = out_dir / "summary_by_all_axes.csv"
