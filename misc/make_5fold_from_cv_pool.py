@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cv_pool を K-fold にクラス比維持で分割し、各 fold に train/val/test と data.yaml を生成（YOLO-OBB）
+K-fold にクラス比維持で分割し、各 fold に train/val(/test) と data.yaml を生成（YOLO-OBB）
 
-- cv_pool/images/ の再帰探索時に、先頭ディレクトリが 'train'/'val'/'test' なら自動的に1段剥がして配置（★）
-  例) cv_pool/images/train/sub/img.jpg -> foldK/train/images/sub/img.jpg
+対応入力:
+- 既存: root/cv_pool/{images,labels} + root/test/{images,labels}
+- 追加: root/images/train + root/labels/train（test なし、train/val のみ作成）
+
+- 画像の再帰探索時に、先頭ディレクトリが 'train'/'val'/'test' なら自動的に1段剥がして配置（★）
+    例) cv_pool/images/train/sub/img.jpg -> foldK/train/images/sub/img.jpg
 """
 
 import argparse, random, shutil, os, sys
@@ -82,7 +86,7 @@ def maybe_strip_leading(rel: Path, enable: bool, extra_drop: int) -> Path:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", required=True, help="データルート（cv_pool/ と test/ を含む）")
+    ap.add_argument("--root", required=True, help="データルート（cv_pool/test 形式または images/train 形式）")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--primary", choices=["first","maxfreq"], default="first", help="主ラベル決定方法")
@@ -97,25 +101,49 @@ def main():
 
     random.seed(args.seed)
     root = Path(args.root).resolve()
+
+    # 入力構成を自動判別
     cv_img_dir = root/"cv_pool"/"images"
     cv_lab_dir = root/"cv_pool"/"labels"
     test_img_src = root/"test"/"images"
     test_lab_src = root/"test"/"labels"
-    assert cv_img_dir.exists() and cv_lab_dir.exists(), "cv_pool/images と cv_pool/labels が必要です"
-    assert test_img_src.exists() and test_lab_src.exists(), "test/images と test/labels が必要です"
+    trainonly_img_dir = root/"images"/"train"
+    trainonly_lab_dir = root/"labels"/"train"
+
+    has_cv_pool = cv_img_dir.exists() and cv_lab_dir.exists()
+    has_test = test_img_src.exists() and test_lab_src.exists()
+    has_trainonly = trainonly_img_dir.exists() and trainonly_lab_dir.exists()
+
+    if has_cv_pool:
+        split_img_dir = cv_img_dir
+        split_lab_dir = cv_lab_dir
+        use_test = has_test
+        if not has_test:
+            print("[INFO] test/images と test/labels が見つからないため、train/val のみ生成します。")
+    elif has_trainonly:
+        split_img_dir = trainonly_img_dir
+        split_lab_dir = trainonly_lab_dir
+        use_test = False
+    else:
+        raise AssertionError(
+            "入力構成を判別できません。\n"
+            "必要条件のいずれかを満たしてください:\n"
+            "  1) root/cv_pool/images と root/cv_pool/labels\n"
+            "  2) root/images/train と root/labels/train"
+        )
 
     names, nc, channels = load_meta_from_yaml(Path(args.source_yaml))
 
-    # cv_pool を収集
-    cv_imgs = collect_images_recursive(cv_img_dir)
+    # 分割対象画像を収集
+    split_imgs = collect_images_recursive(split_img_dir)
 
     # items = [(cls, img_abs, lab_abs, rel_from_images_stripped)]
     items = []
-    for ip in cv_imgs:
-        rel = ip.relative_to(cv_img_dir)
+    for ip in split_imgs:
+        rel = ip.relative_to(split_img_dir)
         # ★ ここで剥がす
         rel_out = maybe_strip_leading(rel, enable=args.strip_prefix, extra_drop=args.strip_levels)
-        lp = cv_lab_dir / rel.with_suffix(".txt")  # 対応ラベルは元の rel で参照する（存在確認用）
+        lp = split_lab_dir / rel.with_suffix(".txt")  # 対応ラベルは元の rel で参照する（存在確認用）
         cls = get_primary_class_from_yolo_obb(lp, mode=args.primary) if lp.exists() else "NEG"
         items.append((cls, ip, lp, rel_out))
 
@@ -158,33 +186,38 @@ def main():
                 dst_lab.parent.mkdir(parents=True, exist_ok=True)
                 if not dst_lab.exists(): dst_lab.write_text("", encoding="utf-8")
 
-        # test は共通ソースを fold 内にコピー/リンク
-        test_imgs = collect_images_recursive(test_img_src)
-        for ip in test_imgs:
-            rel_t = ip.relative_to(test_img_src)
-            # ★ test 側も、もし先頭が train/val/test なら同様に剥がす（整合のため）
-            rel_t_out = maybe_strip_leading(rel_t, enable=args.strip_prefix, extra_drop=args.strip_levels)
-            lp = test_lab_src / rel_t.with_suffix(".txt")
-            link_or_copy(ip, te_img/rel_t_out, use_symlink=args.use_symlink)
-            dst_lab = te_lab/rel_t_out.with_suffix(".txt")
-            if lp.exists():
-                link_or_copy(lp, dst_lab, use_symlink=args.use_symlink)
-            else:
-                dst_lab.parent.mkdir(parents=True, exist_ok=True)
-                if not dst_lab.exists(): dst_lab.write_text("", encoding="utf-8")
+        # test は存在する場合のみ共通ソースを fold 内にコピー/リンク
+        if use_test:
+            test_imgs = collect_images_recursive(test_img_src)
+            for ip in test_imgs:
+                rel_t = ip.relative_to(test_img_src)
+                # ★ test 側も、もし先頭が train/val/test なら同様に剥がす（整合のため）
+                rel_t_out = maybe_strip_leading(rel_t, enable=args.strip_prefix, extra_drop=args.strip_levels)
+                lp = test_lab_src / rel_t.with_suffix(".txt")
+                link_or_copy(ip, te_img/rel_t_out, use_symlink=args.use_symlink)
+                dst_lab = te_lab/rel_t_out.with_suffix(".txt")
+                if lp.exists():
+                    link_or_copy(lp, dst_lab, use_symlink=args.use_symlink)
+                else:
+                    dst_lab.parent.mkdir(parents=True, exist_ok=True)
+                    if not dst_lab.exists(): dst_lab.write_text("", encoding="utf-8")
 
         # list 作成（foldK からの相対パス）
         def collect(img_root: Path): return sorted([p for p in img_root.rglob("*") if p.suffix.lower() in IMG_EXTS])
-        train_imgs_out = collect(tr_img); val_imgs_out = collect(va_img); test_imgs_out = collect(te_img)
+        train_imgs_out = collect(tr_img)
+        val_imgs_out = collect(va_img)
+        test_imgs_out = collect(te_img) if use_test else []
         write_list_txt(fold_dir, fold_dir/"train.txt", train_imgs_out)
         write_list_txt(fold_dir, fold_dir/"val.txt",   val_imgs_out)
-        write_list_txt(fold_dir, fold_dir/"test.txt",  test_imgs_out)
+        if use_test:
+            write_list_txt(fold_dir, fold_dir/"test.txt",  test_imgs_out)
 
         # data.yaml
         data_yaml = {"path": str(fold_dir.resolve()), 
                      "train": str((fold_dir/"train").resolve()), 
-                     "val": str((fold_dir/"val").resolve()), 
-                     "test": str((fold_dir/"test").resolve())}
+                     "val": str((fold_dir/"val").resolve())}
+        if use_test:
+            data_yaml["test"] = str((fold_dir/"test").resolve())
         if names is not None: data_yaml["names"] = names
         if nc is not None:    data_yaml["nc"] = nc
         if channels is not None: data_yaml["channels"] = channels
