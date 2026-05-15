@@ -1,0 +1,53 @@
+# 追学習用（exp096ベース）
+task: obb
+
+# 既存学習済み重みを指定（必要に応じてパスを修正）
+model: models/celldivdet.exp096_yolo11l-obb.pt
+models: []
+
+project: runs_obb
+name_prefix: exp096_ft113
+device: "0,1"
+
+train:
+  # Optimizer固定で lr0 比較
+  epochs: 150
+  patience: 50
+  imgsz: 1920
+  batch: 16
+
+  seed: 0
+  cos_lr: true
+  warmup_epochs: 1
+  optimizer: AdamW
+  lr0: [0.001, 0.003]
+  momentum: 0.9
+  weight_decay: 0.0005
+  lrf: 0.01
+
+  # ここまでの結果から固定
+  freeze: 0
+
+  # 強拡張は抑える
+  degrees: 180
+  fliplr: 0.5
+  flipud: 0.6
+  hsv_v: 0.2
+  hsv_s: 0.05
+  # Stage Aではmosaicは固定（試行数を抑える）
+  mosaic: 0.1
+  close_mosaic: 10
+  copy_paste: 0.1
+  translate: 0.1
+  scale: 0.2
+  shear: 0.5
+
+val:
+  save_txt: false
+  save_json: false
+
+test:
+  split: test
+  iou: 0.50:0.95
+  save_json: true
+  conf: 0.001

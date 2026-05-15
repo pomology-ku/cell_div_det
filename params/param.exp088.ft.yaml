@@ -1,0 +1,51 @@
+# 追学習用（exp088ベース）
+task: obb
+
+# 既存学習済み重みを指定（必要に応じてパスを修正）
+model: models/celldivdet.exp088_yolo11m-obb.pt
+models: []
+
+project: runs_obb
+name_prefix: exp088_ft113
+device: 0
+
+train:
+  # Stage A（少数試行）
+  epochs: 150
+  patience: 50
+  imgsz: 1280
+  batch: 16
+
+  seed: 0
+  cos_lr: true
+  warmup_epochs: 1
+
+  lr0: [0.0007, 0.001, 0.0015]
+  lrf: 0.01
+
+  # 凍結量を2点だけ比較
+  freeze: [10, 20]
+
+  # 強拡張は抑える
+  degrees: 180
+  fliplr: 0.5
+  flipud: 0.6
+  hsv_v: 0.2
+  hsv_s: 0.05
+  # Stage Aではmosaicは固定（試行数を抑える）
+  mosaic: 0.1
+  close_mosaic: 10
+  copy_paste: 0.1
+  translate: 0.1
+  scale: 0.2
+  shear: 0.5
+
+val:
+  save_txt: false
+  save_json: false
+
+test:
+  split: test
+  iou: 0.50:0.95
+  save_json: true
+  conf: 0.001
