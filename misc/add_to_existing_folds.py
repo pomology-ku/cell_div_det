@@ -54,14 +54,30 @@ def write_list_txt(base_dir: Path, file_path: Path, image_paths_abs: list[Path])
     rels = [str(p.relative_to(base_dir)).replace(os.sep, "/") for p in image_paths_abs]
     file_path.write_text("\n".join(rels) + "\n", encoding="utf-8")
 
+def _resolve_pos_src(add_root: Path):
+    """
+    Return (img_src, lab_src) for a positive dataset root.
+    Accepts two layouts:
+      A)  add_root/images/  + add_root/labels/           (flat, e.g. after -a .../train)
+      B)  add_root/images/train/ + add_root/labels/train/ (CVAT export root)
+    """
+    flat_img = add_root / "images"
+    flat_lab = add_root / "labels"
+    if flat_img.exists() and flat_lab.exists():
+        return flat_img, flat_lab
+    nested_img = add_root / "images" / "train"
+    nested_lab = add_root / "labels" / "train"
+    if nested_img.exists() and nested_lab.exists():
+        return nested_img, nested_lab
+    return None, None
+
 def add_positive_source(add_root: Path, fold_dirs, prefix: str, tag: str, use_symlink: bool, skip: bool, grand_total: list[int]):
-    img_src = add_root / "images" / "train"
-    lab_src = add_root / "labels" / "train"
-    if not img_src.exists() or not lab_src.exists():
-        print(f"[ERR] {add_root} must contain images/train and labels/train", file=sys.stderr)
+    img_src, lab_src = _resolve_pos_src(add_root)
+    if img_src is None:
+        print(f"[ERR] {add_root} must contain images/+labels/ or images/train/+labels/train/", file=sys.stderr)
         sys.exit(1)
     imgs = collect_images_recursive(img_src)
-    print(f"[INFO] POS '{add_root}' ({len(imgs)} imgs) -> subdir '{prefix}/{tag}'")
+    print(f"[INFO] POS '{add_root}' ({len(imgs)} imgs, src={img_src.relative_to(add_root)}) -> subdir '{prefix}/{tag}'")
     for fold in fold_dirs:
         tr_img = fold/"train"/"images"/prefix/tag
         tr_lab = fold/"train"/"labels"/prefix/tag
