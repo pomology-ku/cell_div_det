@@ -70,7 +70,13 @@ def load_gt_coco(gt_json: Path):
     cats = gt.get("categories", []) or []
     cat_name = {int(c["id"]): str(c.get("name", c["id"])) for c in cats if "id" in c}
     img_ids = set(int(im["id"]) for im in images if "id" in im)
-    return img_ids, anns, cat_name
+    id_to_file = {
+        int(im["id"]): str(im.get("file_name", ""))
+        for im in images
+        if "id" in im and im.get("file_name", "") != ""
+    }
+    file_to_id = {v: k for k, v in id_to_file.items()}
+    return img_ids, anns, cat_name, id_to_file, file_to_id
 
 
 def load_pred_coco(pred_json: Path) -> List[dict]:
@@ -79,6 +85,102 @@ def load_pred_coco(pred_json: Path) -> List[dict]:
     if not isinstance(dets, list):
         raise ValueError(f"Prediction JSON must be a list (COCO results format): {pred_json}")
     return dets
+
+
+def build_unique_basename_map(file_to_id: Dict[str, int]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for fname in file_to_id.keys():
+        base = Path(fname).name
+        counts[base] = counts.get(base, 0) + 1
+    return {
+        Path(fname).name: img_id
+        for fname, img_id in file_to_id.items()
+        if counts.get(Path(fname).name, 0) == 1
+    }
+
+
+def remap_dets_to_canonical_gt(
+    dets: List[dict],
+    src_gt_json: Optional[Path],
+    canonical_file_to_id: Dict[str, int],
+) -> List[dict]:
+    """Map detections from another eval.py export onto the canonical GT image_id space."""
+    if src_gt_json is None:
+        return dets
+
+    _, _, _, src_id_to_file, _ = load_gt_coco(src_gt_json)
+    canonical_basename_to_id = build_unique_basename_map(canonical_file_to_id)
+    remapped = []
+    dropped = 0
+
+    for d in dets:
+        try:
+            src_img_id = int(d["image_id"])
+        except Exception:
+            dropped += 1
+            continue
+        fname = src_id_to_file.get(src_img_id)
+        if fname is None:
+            dropped += 1
+            continue
+
+        new_img_id = canonical_file_to_id.get(fname)
+        if new_img_id is None:
+            new_img_id = canonical_basename_to_id.get(Path(fname).name)
+        if new_img_id is None:
+            dropped += 1
+            continue
+
+        dd = dict(d)
+        dd["image_id"] = int(new_img_id)
+        remapped.append(dd)
+
+    if dropped:
+        print(f"[WARN] remap from {src_gt_json}: dropped {dropped} detections with no canonical image match.")
+    return remapped
+
+
+def build_gt_signature(
+    gt_img_ids: set,
+    gt_anns: list,
+    id_to_file: Dict[int, str],
+) -> Dict[Tuple[str, int], int]:
+    sig: Dict[Tuple[str, int], int] = {}
+    for a in gt_anns:
+        try:
+            img_id = int(a["image_id"])
+            cid = int(a["category_id"])
+        except Exception:
+            continue
+        if gt_img_ids and img_id not in gt_img_ids:
+            continue
+        fname = id_to_file.get(img_id, str(img_id))
+        sig[(fname, cid)] = sig.get((fname, cid), 0) + 1
+    return sig
+
+
+def print_gt_diff(
+    canonical_gt_json: Path,
+    other_gt_json: Path,
+    canonical_id_to_file: Dict[int, str],
+    canonical_img_ids: set,
+    canonical_anns: list,
+):
+    other_img_ids, other_anns, _, other_id_to_file, _ = load_gt_coco(other_gt_json)
+    sig_a = build_gt_signature(canonical_img_ids, canonical_anns, canonical_id_to_file)
+    sig_b = build_gt_signature(other_img_ids, other_anns, other_id_to_file)
+    keys = sorted(set(sig_a.keys()) | set(sig_b.keys()))
+    diffs = [(k, sig_a.get(k, 0), sig_b.get(k, 0)) for k in keys if sig_a.get(k, 0) != sig_b.get(k, 0)]
+
+    if not diffs:
+        print(f"[GT CHECK] {canonical_gt_json.name} and {other_gt_json.name}: same GT counts by file_name/category_id.")
+        return
+
+    print(f"[GT CHECK] {canonical_gt_json.name} vs {other_gt_json.name}: {len(diffs)} file/category count differences.")
+    for (fname, cid), ca, cb in diffs[:20]:
+        print(f"  category={cid}  canonical={ca}  other={cb}  file={fname}")
+    if len(diffs) > 20:
+        print(f"  ... {len(diffs) - 20} more differences")
 
 
 def compute_recall_from_coco(
@@ -182,21 +284,28 @@ def compute_recall_from_coco(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gt", required=True, help="GT COCO dataset JSON exported by eval.py (tta_gt_conf*.coco.json)")
+    ap.add_argument("--gt_a", default=None, help="Optional GT JSON that defines pred_a image_id mapping; defaults to --gt")
+    ap.add_argument("--gt_b", default=None, help="Optional GT JSON that defines pred_b image_id mapping")
     ap.add_argument("--pred_a", required=True, help="Prediction COCO results JSON A (tta_pred_conf*.coco.json)")
     ap.add_argument("--pred_b", required=True, help="Prediction COCO results JSON B (tta_pred_conf*.coco.json)")
     ap.add_argument("--conf_thresh", type=float, default=0.10, help="confidence threshold for recall")
     ap.add_argument("--recall_iou", type=float, default=0.50, help="IoU threshold for recall matching")
     ap.add_argument("--iou_mode", choices=["obb", "aabb"], default="obb", help="IoU type (obb=polygon IoU, aabb=axis-aligned)")
     ap.add_argument("--print_per_class", action="store_true", help="print per-class recall")
+    ap.add_argument("--check_gt_diff", action="store_true", help="compare --gt against --gt_a/--gt_b by file_name/category counts")
     args = ap.parse_args()
 
     gt_path = Path(args.gt).resolve()
+    gt_a_path = Path(args.gt_a).resolve() if args.gt_a else None
+    gt_b_path = Path(args.gt_b).resolve() if args.gt_b else None
     pred_a_path = Path(args.pred_a).resolve()
     pred_b_path = Path(args.pred_b).resolve()
 
-    gt_img_ids, gt_anns, cat_name = load_gt_coco(gt_path)
+    gt_img_ids, gt_anns, cat_name, gt_id_to_file, gt_file_to_id = load_gt_coco(gt_path)
     det_a = load_pred_coco(pred_a_path)
     det_b = load_pred_coco(pred_b_path)
+    det_a = remap_dets_to_canonical_gt(det_a, gt_a_path, gt_file_to_id)
+    det_b = remap_dets_to_canonical_gt(det_b, gt_b_path, gt_file_to_id)
 
     # Basic sanity checks
     def _warn_bad_ids(dets: list, label: str):
@@ -238,6 +347,10 @@ def main():
 
     print("\n[RECALL SUMMARY]")
     print(f"GT: {gt_path}")
+    if gt_a_path:
+        print(f"gt_a map: {gt_a_path}")
+    if gt_b_path:
+        print(f"gt_b map: {gt_b_path}")
     print(f"pred_a: {pred_a_path}")
     print(f"pred_b: {pred_b_path}")
     print(f"conf_thresh={args.conf_thresh}  recall_iou={args.recall_iou}  iou_mode={args.iou_mode}")
@@ -250,6 +363,14 @@ def main():
         print("\n[PER-CLASS RECALL] (union)")
         for k, v in res_u["per_class_recall"].items():
             print(f"{k}\t{v:.4f}")
+
+    if args.check_gt_diff:
+        if gt_a_path:
+            print("")
+            print_gt_diff(gt_path, gt_a_path, gt_id_to_file, gt_img_ids, gt_anns)
+        if gt_b_path:
+            print("")
+            print_gt_diff(gt_path, gt_b_path, gt_id_to_file, gt_img_ids, gt_anns)
 
 
 if __name__ == "__main__":
