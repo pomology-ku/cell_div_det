@@ -246,8 +246,8 @@ def parse_yolo_obb_line(line: str, tile_w: int, tile_h: int):
 def main():
     ap = argparse.ArgumentParser(description="Merge tiles from XML and overlay COCO bboxes (+ optional GT)")
     ap.add_argument("--xml", '-x', required=True, help="Path to MappingInformation XML")
-    ap.add_argument("--coco", '-j', action="append", required=True,
-                    help="Path to COCO JSON (AABB). Specify twice for A/B overlays.")
+    ap.add_argument("--coco", '-j', action="append", default=None,
+                    help="Path to COCO JSON (AABB). Required unless --no-overlay. Specify twice for A/B overlays.")
     ap.add_argument("--img-root", '-i', required=True, help="Directory containing tile images")
     ap.add_argument("--out", '-o', required=True, help="Output mosaic image (.png recommended)")
 
@@ -309,6 +309,9 @@ def main():
     if len(coco_paths) > 2:
         print("[ERROR] --coco can be specified at most twice (A/B).", file=sys.stderr)
         sys.exit(1)
+    if not args.no_overlay and not coco_paths:
+        print("[ERROR] --coco is required unless --no-overlay is specified.", file=sys.stderr)
+        sys.exit(1)
     img_root = Path(args.img_root)
     out_path = Path(args.out)
 
@@ -318,15 +321,16 @@ def main():
         sys.exit(1)
 
     coco_sets = []
-    for idx, cpath in enumerate(coco_paths):
-        img_by_id, _, anns_by_img, cat_name = parse_coco(cpath)
-        coco_sets.append({
-            "name": "A" if idx == 0 else "B",
-            "path": cpath,
-            "img_by_id": img_by_id,
-            "anns_by_img": anns_by_img,
-            "cat_name": cat_name,
-        })
+    if not args.no_overlay:
+        for idx, cpath in enumerate(coco_paths):
+            img_by_id, _, anns_by_img, cat_name = parse_coco(cpath)
+            coco_sets.append({
+                "name": "A" if idx == 0 else "B",
+                "path": cpath,
+                "img_by_id": img_by_id,
+                "anns_by_img": anns_by_img,
+                "cat_name": cat_name,
+            })
 
     # Compute tile absolute positions (pre-shift)
     positions = []  # list of (tile, x, y)
