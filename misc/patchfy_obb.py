@@ -14,8 +14,9 @@ Output tree (mirrors input subdirs):
       labels/<relpath_without_ext>__r{row}_c{col}.txt
 
 Rules:
-  * Each object is assigned to the best patch among owner+8-neighbors by
-    maximizing the post-slide area.
+  * Each object is written once. By default, objects that can share a patch are
+    grouped and assigned to one common patch. Use --assign_mode best to assign
+    each object independently, or all to duplicate objects into all overlaps.
   * Optional (--shift_crop_to_fit): try to shift the crop origin so ALL objects
     in the same tile fit without clipping. If full fit is impossible, fallback to
     default crop origin (original behavior).
@@ -29,6 +30,7 @@ Rules:
 import argparse
 from pathlib import Path
 import math
+from collections import defaultdict
 from typing import List
 import cv2, numpy as np
 
@@ -336,6 +338,116 @@ def _best_tile_for_object(pts_abs, cx, cy, W, H, P, S, min_area):
         return (None, None)
     return best, best_area
 
+def _overlapping_tiles_for_object(pts_abs, W, H, P, S, min_area):
+    """
+    Return all tiles where the object's bbox overlaps the crop and the slid
+    polygon keeps enough area. This is the usual detection-training behavior:
+    overlapped crops should each get the visible object label.
+    """
+    n_rows = max(1, math.ceil((H - P) / S) + 1)
+    n_cols = max(1, math.ceil((W - P) / S) + 1)
+
+    minx = float(np.min(pts_abs[:, 0]))
+    maxx = float(np.max(pts_abs[:, 0]))
+    miny = float(np.min(pts_abs[:, 1]))
+    maxy = float(np.max(pts_abs[:, 1]))
+
+    tiles = []
+    seen_origins = set()
+    for r in range(n_rows):
+        for c in range(n_cols):
+            x0, y0 = _tile_origin(r, c, W, H, P, S)
+            origin = (x0, y0)
+            if origin in seen_origins:
+                continue
+            seen_origins.add(origin)
+
+            # Strict separation test for bbox-vs-crop. Touching only at an
+            # edge has zero area and will be ignored.
+            if maxx <= x0 or minx >= x0 + P or maxy <= y0 or miny >= y0 + P:
+                continue
+
+            poly, area = _eval_object_at_origin(pts_abs, x0, y0, P, min_area)
+            if poly is not None and area >= min_area:
+                tiles.append((r, c))
+    return tiles
+
+def _group_objects_by_shared_tiles(object_options):
+    """
+    Build connected components where objects are connected if they have at least
+    one feasible tile in common. This keeps nearby objects together when a patch
+    can show them together, while still writing each source object only once.
+    """
+    tile_to_objs = defaultdict(list)
+    for idx, options in enumerate(object_options):
+        for tile in options:
+            tile_to_objs[tile].append(idx)
+
+    parent = list(range(len(object_options)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for obj_ids in tile_to_objs.values():
+        if len(obj_ids) < 2:
+            continue
+        first = obj_ids[0]
+        for obj_id in obj_ids[1:]:
+            union(first, obj_id)
+
+    groups = defaultdict(list)
+    for idx in range(len(object_options)):
+        groups[find(idx)].append(idx)
+    return list(groups.values())
+
+def _group_indices_by_shared_tiles(indices, object_options):
+    local_options = [object_options[idx] for idx in indices]
+    local_groups = _group_objects_by_shared_tiles(local_options)
+    return [[indices[local_idx] for local_idx in group] for group in local_groups]
+
+def _best_shared_tile_for_group(group, object_options, objects, W, H, P, S, min_area):
+    """
+    Pick one tile for a group. Prefer tiles that can keep the most group objects,
+    then the largest retained area. This guarantees each source object is
+    assigned once, even when no single tile can keep the whole group.
+    """
+    candidate_tiles = sorted(set().union(*(object_options[i] for i in group)))
+    best_tile = None
+    best_members = []
+    best_score = (-1, -1.0)
+
+    for tile in candidate_tiles:
+        r, c = tile
+        x0, y0 = _tile_origin(r, c, W, H, P, S)
+        members = []
+        total_area = 0.0
+        for idx in group:
+            cls, pts = objects[idx]
+            if tile not in object_options[idx]:
+                continue
+            poly, area = _eval_object_at_origin(pts, x0, y0, P, min_area)
+            if poly is None or area < min_area:
+                continue
+            members.append(idx)
+            total_area += area
+
+        score = (len(members), total_area)
+        if score > best_score:
+            best_score = score
+            best_tile = tile
+            best_members = members
+
+    return best_tile, best_members
+
 def _resolve_tile_crop_and_labels(items, r, c, W, H, P, S, min_area, shift_crop_to_fit=False):
     """
     Decide the crop origin for this tile and return (origin, kept_labels).
@@ -443,7 +555,8 @@ def _resolve_tile_crop_and_labels(items, r, c, W, H, P, S, min_area, shift_crop_
     return default_origin, kept
 
 def process_one(img_path, rel, lbl_root, out_root, P, S, min_area,
-                keep_neg, max_neg, force_ext, dry_run, shift_crop_to_fit=False):
+                keep_neg, max_neg, force_ext, dry_run, shift_crop_to_fit=False,
+                assign_mode="group"):
     lbl_path = lbl_root / rel.with_suffix('.txt')
     img = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
@@ -455,17 +568,60 @@ def process_one(img_path, rel, lbl_root, out_root, P, S, min_area,
     if len(objs) == 0 and not keep_neg:
         return (0, 0)
 
-    # Pre-assign each object to its best tile (owner + 8 neighbors)
+    # Pre-assign each object to target tiles.
     assigned = {}
+    indexed_objs = []
+    object_options = []
+
     for cls, pts in objs:
-        cx, cy = poly_centroid(pts)
-        best, best_area = _best_tile_for_object(
-            pts_abs=pts, cx=cx, cy=cy, W=W, H=H, P=P, S=S, min_area=min_area)
-        if best is None or best_area < min_area:
+        if assign_mode == "best":
+            cx, cy = poly_centroid(pts)
+            best, best_area = _best_tile_for_object(
+                pts_abs=pts, cx=cx, cy=cy, W=W, H=H, P=P, S=S, min_area=min_area)
+            tiles = [] if best is None or best_area < min_area else [best]
+        else:
+            tiles = _overlapping_tiles_for_object(
+                pts_abs=pts, W=W, H=H, P=P, S=S, min_area=min_area)
+
+        if not tiles:
             continue
-        if best not in assigned:
-            assigned[best] = []
-        assigned[best].append((cls, pts))
+
+        indexed_objs.append((cls, pts))
+        object_options.append(tiles)
+
+    if assign_mode == "all":
+        for idx, tiles in enumerate(object_options):
+            cls, pts = indexed_objs[idx]
+            for tile in tiles:
+                if tile not in assigned:
+                    assigned[tile] = []
+                assigned[tile].append((cls, pts))
+    elif assign_mode == "group":
+        pending_groups = _group_objects_by_shared_tiles(object_options)
+        while pending_groups:
+            next_groups = []
+            for group in pending_groups:
+                tile, members = _best_shared_tile_for_group(
+                    group, object_options, indexed_objs, W, H, P, S, min_area)
+                if tile is None or not members:
+                    continue
+                if tile not in assigned:
+                    assigned[tile] = []
+                for idx in members:
+                    assigned[tile].append(indexed_objs[idx])
+
+                member_set = set(members)
+                leftovers = [idx for idx in group if idx not in member_set]
+                if leftovers:
+                    next_groups.extend(_group_indices_by_shared_tiles(leftovers, object_options))
+            pending_groups = next_groups
+    else:
+        for idx, tiles in enumerate(object_options):
+            cls, pts = indexed_objs[idx]
+            tile = tiles[0]
+            if tile not in assigned:
+                assigned[tile] = []
+            assigned[tile].append((cls, pts))
 
     # Resolve crop origin and labels for each occupied tile
     tile_outputs = {}
@@ -525,6 +681,10 @@ def main():
     ap.add_argument('--shift_crop_to_fit', action='store_true',
                     help='Move crop origin to avoid cutting bboxes when possible; '
                          'fallback to default crop if full fit is impossible.')
+    ap.add_argument('--assign_mode', choices=['group', 'best', 'all'], default='group',
+                    help='Label assignment mode. group writes each object once and keeps shared '
+                         'objects together when possible; best assigns objects independently; '
+                         'all duplicates objects into every overlapping patch.')
     ap.add_argument('--ext', default=None)
     ap.add_argument('--dry_run', action='store_true')
     args = ap.parse_args()
@@ -540,7 +700,8 @@ def main():
             img_path=img_path, rel=rel, lbl_root=Path(args.label_dir), out_root=Path(args.out_dir),
             P=args.patch_size, S=args.stride,
             min_area=args.min_area, keep_neg=args.keep_neg, max_neg=args.max_neg_ratio,
-            force_ext=args.ext, dry_run=args.dry_run, shift_crop_to_fit=args.shift_crop_to_fit)
+            force_ext=args.ext, dry_run=args.dry_run, shift_crop_to_fit=args.shift_crop_to_fit,
+            assign_mode=args.assign_mode)
         total_pos += pos; total_neg += neg
     print(f"[DONE] Pos={total_pos} Neg={total_neg}")
 
