@@ -7,6 +7,7 @@ Input tree (recursive):
   - Images under --img_dir (any subdir structure)
   - Labels under --label_dir mirroring image relative paths, with .txt files where
     each line is: cls x1 y1 x2 y2 x3 y3 x4 y4  (coords normalized to [0,1])
+    --label_dir may be omitted when --keep_neg is used for unlabeled negatives.
 
 Output tree (mirrors input subdirs):
   --out_dir/
@@ -557,14 +558,14 @@ def _resolve_tile_crop_and_labels(items, r, c, W, H, P, S, min_area, shift_crop_
 def process_one(img_path, rel, lbl_root, out_root, P, S, min_area,
                 keep_neg, max_neg, force_ext, dry_run, shift_crop_to_fit=False,
                 assign_mode="group"):
-    lbl_path = lbl_root / rel.with_suffix('.txt')
     img = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
         return (0, 0)
     H, W = img.shape[:2]
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    objs = read_label(lbl_path, W, H)
+    lbl_path = None if lbl_root is None else lbl_root / rel.with_suffix('.txt')
+    objs = [] if lbl_path is None else read_label(lbl_path, W, H)
     if len(objs) == 0 and not keep_neg:
         return (0, 0)
 
@@ -649,13 +650,14 @@ def process_one(img_path, rel, lbl_root, out_root, P, S, min_area,
             out_lbl = out_root / 'labels' / f"{relname}.txt"
 
             if not kept:
-                if keep_neg and neg < math.ceil(max_neg * max(1, len(objs))) and not dry_run:
-                    out_img.parent.mkdir(parents=True, exist_ok=True)
-                    out_lbl.parent.mkdir(parents=True, exist_ok=True)
-                    tile = img[y0:y1, x0:x1]
-                    cv2.imencode(f'.{ext}', tile)[1].tofile(str(out_img))
-                    open(out_lbl, 'w').close()
-                neg += 1
+                if keep_neg and neg < math.ceil(max_neg * max(1, len(objs))):
+                    if not dry_run:
+                        out_img.parent.mkdir(parents=True, exist_ok=True)
+                        out_lbl.parent.mkdir(parents=True, exist_ok=True)
+                        tile = img[y0:y1, x0:x1]
+                        cv2.imencode(f'.{ext}', tile)[1].tofile(str(out_img))
+                        open(out_lbl, 'w').close()
+                    neg += 1
                 continue
 
             if not dry_run:
@@ -671,7 +673,8 @@ def process_one(img_path, rel, lbl_root, out_root, P, S, min_area,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-i', '--img_dir', required=True)
-    ap.add_argument('-l', '--label_dir', required=True)
+    ap.add_argument('-l', '--label_dir', default=None,
+                    help='Directory containing labels. Required unless --keep_neg is used.')
     ap.add_argument('-o', '--out_dir', required=True)
     ap.add_argument('-p', '--patch_size', type=int, default=1280)
     ap.add_argument('-s', '--stride', type=int, default=384)
@@ -689,7 +692,12 @@ def main():
     ap.add_argument('--dry_run', action='store_true')
     args = ap.parse_args()
 
-    img_root, lbl_root, out_root = Path(args.img_dir), Path(args.label_dir), Path(args.out_dir)
+    if args.label_dir is None and not args.keep_neg:
+        ap.error("--label_dir is required unless --keep_neg is specified")
+
+    img_root = Path(args.img_dir)
+    lbl_root = None if args.label_dir is None else Path(args.label_dir)
+    out_root = Path(args.out_dir)
     (out_root / 'images').mkdir(parents=True, exist_ok=True)
     (out_root / 'labels').mkdir(parents=True, exist_ok=True)
 
@@ -697,7 +705,7 @@ def main():
     for img_path in find_images(img_root):
         rel = img_path.relative_to(img_root).with_suffix('')
         pos, neg = process_one(
-            img_path=img_path, rel=rel, lbl_root=Path(args.label_dir), out_root=Path(args.out_dir),
+            img_path=img_path, rel=rel, lbl_root=lbl_root, out_root=out_root,
             P=args.patch_size, S=args.stride,
             min_area=args.min_area, keep_neg=args.keep_neg, max_neg=args.max_neg_ratio,
             force_ext=args.ext, dry_run=args.dry_run, shift_crop_to_fit=args.shift_crop_to_fit,
