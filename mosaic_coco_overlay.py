@@ -160,7 +160,13 @@ def parse_mapping_xml(xml_path: Path):
 
 def parse_coco(coco_path: Path):
     with open(coco_path, "r", encoding="utf-8") as f:
-        coco = json.load(f)
+        text = f.read()
+    try:
+        coco = json.loads(text)
+    except json.JSONDecodeError:
+        # Handles "Extra data" caused by concatenated writes: take the first valid JSON object
+        coco, end = json.JSONDecoder().raw_decode(text.lstrip())
+        print(f"[WARN] {coco_path.name}: extra data after JSON (pos {end}); using first object only.")
     img_by_id = {}
     imgs_by_key = defaultdict(list)
     for im in coco.get("images", []):
