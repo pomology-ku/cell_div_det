@@ -55,6 +55,7 @@ SCAN_KEYS = [
     "imgsz", "img_size", "epochs", "batch",
     # nms系（args.yaml側）
     "iou", "conf", "agnostic_nms", "augment",
+    "split", "fold", "eval_only", "weights",
     # 学習率系（変えてたら拾う）
     "lr0", "lrf", "cos_lr", "momentum", "weight_decay",
     # fine-tune系
@@ -327,6 +328,35 @@ def _deep_find_any(d, keys):
     return None, None
 
 
+def build_summary_agg(df: pd.DataFrame, include_last_metrics: bool) -> dict:
+    agg_dict = {
+        "n": ("score_for_group", "count"),
+        "mean_mAP50_95": ("best_mAP50-95", "mean"),
+        "std_mAP50_95": ("best_mAP50-95", "std"),
+        "mean_mAP50": ("best_mAP50", "mean"),
+        "std_mAP50": ("best_mAP50", "std"),
+    }
+    if "best_recall" in df.columns:
+        agg_dict["mean_best_recall"] = ("best_recall", "mean")
+        agg_dict["std_best_recall"] = ("best_recall", "std")
+    if "best_precision" in df.columns:
+        agg_dict["mean_best_precision"] = ("best_precision", "mean")
+        agg_dict["std_best_precision"] = ("best_precision", "std")
+    if include_last_metrics and "last_mAP50-95" in df.columns:
+        agg_dict["mean_last_mAP50_95"] = ("last_mAP50-95", "mean")
+        agg_dict["std_last_mAP50_95"] = ("last_mAP50-95", "std")
+    if include_last_metrics and "last_mAP50" in df.columns:
+        agg_dict["mean_last_mAP50"] = ("last_mAP50", "mean")
+        agg_dict["std_last_mAP50"] = ("last_mAP50", "std")
+    if include_last_metrics and "last_recall" in df.columns:
+        agg_dict["mean_last_recall"] = ("last_recall", "mean")
+        agg_dict["std_last_recall"] = ("last_recall", "std")
+    if include_last_metrics and "last_precision" in df.columns:
+        agg_dict["mean_last_precision"] = ("last_precision", "mean")
+        agg_dict["std_last_precision"] = ("last_precision", "std")
+    return agg_dict
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", "-p", required=True, help="Ultralyticsのプロジェクトディレクトリ（例: runs_obb）")
@@ -369,7 +399,10 @@ def main():
             continue
         if args.name_prefix and not run_dir.name.startswith(args.name_prefix):
             continue
-        if not (run_dir / "weights" / "best.pt").exists():
+        run_args = load_yaml_safe(run_dir / "args.yaml")
+        is_eval_only = bool(run_args.get("eval_only", False))
+        has_best = (run_dir / "weights" / "best.pt").exists()
+        if not has_best and not is_eval_only:
             continue
 
         csv_path = run_dir / "results.csv"
@@ -462,6 +495,21 @@ def main():
     # スコア列（mAP50-95優先、無ければmAP50）
     df["score_for_group"] = df["best_mAP50-95"].fillna(df["best_mAP50"])
     include_last_metrics = not args.no_last_metrics
+
+    cv_axes = [ax for ax in sweep_axes if ax != "fold" and ax in df.columns]
+    cv_agg = build_summary_agg(df, include_last_metrics)
+    if cv_axes:
+        cv_summary = df.groupby(cv_axes, dropna=False).agg(**cv_agg).reset_index().sort_values(cv_axes)
+        if "fold" in df.columns:
+            fold_counts = df.groupby(cv_axes, dropna=False)["fold"].nunique().reset_index(name="folds")
+            cv_summary = fold_counts.merge(cv_summary, on=cv_axes, how="right")
+    else:
+        cv_summary = df.assign(_cv_all="all").groupby("_cv_all").agg(**cv_agg).reset_index(drop=True)
+        if "fold" in df.columns:
+            cv_summary.insert(0, "folds", df["fold"].nunique(dropna=True))
+    out_cv = out_dir / "summary_cv.csv"
+    cv_summary.to_csv(out_cv, index=False)
+    print(f"[OK] ä¿å­˜: {out_cv}")
 
     # ==== 4) 軸ごとの自動集計（単軸） ====
     for ax in sweep_axes:
@@ -558,6 +606,9 @@ def main():
     # 画面プレビュー
     print("\n=== (preview) per_run head ===")
     print(df.head(10).to_string(index=False))
+    if (out_dir / "summary_cv.csv").exists():
+        print("\n=== (preview) CV summary ===")
+        print(pd.read_csv(out_dir / "summary_cv.csv").to_string(index=False))
     for ax in sweep_axes:
         p = out_dir / f"summary_by_{ax}.csv"
         if p.exists():

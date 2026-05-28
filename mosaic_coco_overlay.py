@@ -160,7 +160,13 @@ def parse_mapping_xml(xml_path: Path):
 
 def parse_coco(coco_path: Path):
     with open(coco_path, "r", encoding="utf-8") as f:
-        coco = json.load(f)
+        text = f.read()
+    try:
+        coco = json.loads(text)
+    except json.JSONDecodeError:
+        # Handles "Extra data" caused by concatenated writes: take the first valid JSON object
+        coco, end = json.JSONDecoder().raw_decode(text.lstrip())
+        print(f"[WARN] {coco_path.name}: extra data after JSON (pos {end}); using first object only.")
     img_by_id = {}
     imgs_by_key = defaultdict(list)
     for im in coco.get("images", []):
@@ -246,8 +252,10 @@ def parse_yolo_obb_line(line: str, tile_w: int, tile_h: int):
 def main():
     ap = argparse.ArgumentParser(description="Merge tiles from XML and overlay COCO bboxes (+ optional GT)")
     ap.add_argument("--xml", '-x', required=True, help="Path to MappingInformation XML")
-    ap.add_argument("--coco", '-j', action="append", required=True,
-                    help="Path to COCO JSON (AABB). Specify twice for A/B overlays.")
+    ap.add_argument("--coco", '-j', action="append", default=None,
+                    help="Path to COCO JSON (AABB). Required unless --no-overlay. "
+                         "Specify twice for A/B overlays (first = A cyan, second = B amber). "
+                         "e.g. -j model_a.json -j model_b.json")
     ap.add_argument("--img-root", '-i', required=True, help="Directory containing tile images")
     ap.add_argument("--out", '-o', required=True, help="Output mosaic image (.png recommended)")
 
@@ -273,8 +281,8 @@ def main():
     s.add_argument("--tile-border", action="store_true", help="Draw tile borders for debugging")
     s.add_argument("--tile-label", action="store_true", help="Draw tile (IndexX,IndexY) label")
     s.add_argument("--ab-iou", type=float, default=0.0, help="Overlap IoU threshold for A/B (default 0.0 = any overlap)")
-    s.add_argument("--color-a", type=str, default="255,0,0", help="COCO A RGB color (default 255,0,0)")
-    s.add_argument("--color-b", type=str, default="0,128,255", help="COCO B RGB color (default 0,128,255)")
+    s.add_argument("--color-a", type=str, default="0,220,255", help="COCO A RGB color (default 0,220,255 = cyan; visible on grayscale)")
+    s.add_argument("--color-b", type=str, default="255,200,0", help="COCO B RGB color (default 255,200,0 = amber; visible on grayscale)")
 
     # GT overlay
     gt = ap.add_argument_group("GT overlay (YOLO-OBB)")
@@ -309,6 +317,9 @@ def main():
     if len(coco_paths) > 2:
         print("[ERROR] --coco can be specified at most twice (A/B).", file=sys.stderr)
         sys.exit(1)
+    if not args.no_overlay and not coco_paths:
+        print("[ERROR] --coco is required unless --no-overlay is specified.", file=sys.stderr)
+        sys.exit(1)
     img_root = Path(args.img_root)
     out_path = Path(args.out)
 
@@ -318,15 +329,16 @@ def main():
         sys.exit(1)
 
     coco_sets = []
-    for idx, cpath in enumerate(coco_paths):
-        img_by_id, _, anns_by_img, cat_name = parse_coco(cpath)
-        coco_sets.append({
-            "name": "A" if idx == 0 else "B",
-            "path": cpath,
-            "img_by_id": img_by_id,
-            "anns_by_img": anns_by_img,
-            "cat_name": cat_name,
-        })
+    if not args.no_overlay:
+        for idx, cpath in enumerate(coco_paths):
+            img_by_id, _, anns_by_img, cat_name = parse_coco(cpath)
+            coco_sets.append({
+                "name": "A" if idx == 0 else "B",
+                "path": cpath,
+                "img_by_id": img_by_id,
+                "anns_by_img": anns_by_img,
+                "cat_name": cat_name,
+            })
 
     # Compute tile absolute positions (pre-shift)
     positions = []  # list of (tile, x, y)
@@ -470,8 +482,8 @@ def main():
     if not args.no_overlay:
         # Draw COCO detections (AABB), support A/B
         font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
-        color_a = parse_rgb(args.color_a, default=(255, 0, 0))
-        color_b = parse_rgb(args.color_b, default=(0, 128, 255))
+        color_a = parse_rgb(args.color_a, default=(0, 220, 255))
+        color_b = parse_rgb(args.color_b, default=(255, 200, 0))
         color_by_name = {"A": color_a, "B": color_b}
 
         def collect_tile_boxes(coco_set):
