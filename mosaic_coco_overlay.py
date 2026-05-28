@@ -247,7 +247,9 @@ def main():
     ap = argparse.ArgumentParser(description="Merge tiles from XML and overlay COCO bboxes (+ optional GT)")
     ap.add_argument("--xml", '-x', required=True, help="Path to MappingInformation XML")
     ap.add_argument("--coco", '-j', action="append", default=None,
-                    help="Path to COCO JSON (AABB). Required unless --no-overlay. Specify twice for A/B overlays.")
+                    help="Path to COCO JSON (AABB). Required unless --no-overlay. "
+                         "Specify twice for A/B overlays (first = A cyan, second = B amber). "
+                         "e.g. -j model_a.json -j model_b.json")
     ap.add_argument("--img-root", '-i', required=True, help="Directory containing tile images")
     ap.add_argument("--out", '-o', required=True, help="Output mosaic image (.png recommended)")
 
@@ -273,8 +275,8 @@ def main():
     s.add_argument("--tile-border", action="store_true", help="Draw tile borders for debugging")
     s.add_argument("--tile-label", action="store_true", help="Draw tile (IndexX,IndexY) label")
     s.add_argument("--ab-iou", type=float, default=0.0, help="Overlap IoU threshold for A/B (default 0.0 = any overlap)")
-    s.add_argument("--color-a", type=str, default="255,0,0", help="COCO A RGB color (default 255,0,0)")
-    s.add_argument("--color-b", type=str, default="0,128,255", help="COCO B RGB color (default 0,128,255)")
+    s.add_argument("--color-a", type=str, default="0,220,255", help="COCO A RGB color (default 0,220,255 = cyan; visible on grayscale)")
+    s.add_argument("--color-b", type=str, default="255,200,0", help="COCO B RGB color (default 255,200,0 = amber; visible on grayscale)")
 
     # GT overlay
     gt = ap.add_argument_group("GT overlay (YOLO-OBB)")
@@ -474,8 +476,8 @@ def main():
     if not args.no_overlay:
         # Draw COCO detections (AABB), support A/B
         font = load_font(max(10, int(args.font_size * (scale if scale != 0 else 1))))
-        color_a = parse_rgb(args.color_a, default=(255, 0, 0))
-        color_b = parse_rgb(args.color_b, default=(0, 128, 255))
+        color_a = parse_rgb(args.color_a, default=(0, 220, 255))
+        color_b = parse_rgb(args.color_b, default=(255, 200, 0))
         color_by_name = {"A": color_a, "B": color_b}
 
         def collect_tile_boxes(coco_set):
