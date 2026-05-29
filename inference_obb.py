@@ -470,10 +470,11 @@ def main():
                     "id": ann_id,
                     "image_id": img_id,
                     "category_id": int(cls_idx) + 1,  # 1始まり
-                    #"segmentation": [arr.tolist()],   # COCOは list[list[...]]
-                    #"area": area,
+                    "segmentation": [arr.tolist()],   # OBB polygon (pixel coords, 8 values)
+                    "area": area,
                     "bbox": [float(b) for b in bbox],
                     "iscrowd": 0,
+                    "score": float(score),
                 })
                 ann_id += 1
 
