@@ -938,9 +938,10 @@ def main():
                 cv2.putText(canvas, pred_legend, (140, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_PR, 2, cv2.LINE_AA)
                 cv2.line(canvas, (270, y0-8), (430, y0-8), C_PR, thick, cv2.LINE_AA)
 
-                out_path = out_dir / f"{img_path.stem}_gt_pred.png"
-                cv2.imwrite(str(out_path), canvas)
-                print(f"[{i}/{len(img_paths)}] saved -> {out_path}")
+                if gt_items or len(polys) > 0:
+                    out_path = out_dir / f"{img_path.stem}_gt_pred.png"
+                    cv2.imwrite(str(out_path), canvas)
+                    print(f"[{i}/{len(img_paths)}] saved -> {out_path}")
 
                 pred_items = []
                 for poly, cls, pred_conf in zip(polys, pred_classes, pred_confs):
