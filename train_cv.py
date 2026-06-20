@@ -12,7 +12,7 @@ YOLOv11 OBB: ハイパラをYAMLで管理し、foldごとに train/val/test を�
     --cfg hyperparams.yaml
 """
 
-import argparse, subprocess, sys
+import argparse, csv, subprocess, sys
 from pathlib import Path
 import yaml
 from itertools import product
@@ -89,6 +89,36 @@ def name_suffix_from_combo(combo: dict, default_imgsz=None, default_epochs=None)
         parts.append(f"{k}{v}")
     return "_".join(parts) if parts else "exp"
 
+def latest_epoch_from_results(run_dir: Path):
+    results_csv = run_dir / "results.csv"
+    if not results_csv.exists():
+        return None
+
+    last_epoch = None
+    try:
+        with open(results_csv, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # header
+            for row in reader:
+                if not row:
+                    continue
+                try:
+                    last_epoch = int(float(row[0].strip()))
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
+        return None
+    return last_epoch
+
+def train_reached_target_epochs(run_dir: Path, epochs):
+    try:
+        target_epochs = int(float(epochs))
+    except (TypeError, ValueError):
+        return False
+
+    last_epoch = latest_epoch_from_results(run_dir)
+    return last_epoch is not None and (last_epoch + 1) >= target_epochs
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="foldK が並ぶ親ディレクトリ (例: dat/v250903)")
@@ -98,6 +128,8 @@ def main():
     ap.add_argument("--end_fold", type=int, default=None, help="このfoldまで（含む）。未指定なら folds-1")
     ap.add_argument("--augmod", default=None,
                     help="外部Albumentationsモジュール（build_train_aug() を持つ）")
+    ap.add_argument("--resume", action="store_true",
+                    help="既存runのlast.ptから再開し、完了済みrunはスキップ")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -161,36 +193,61 @@ def main():
                 seed   = scalar_or_default(this_train, "seed",   seed_default)
                 suffix = name_suffix_from_combo(combo, default_imgsz=imgsz, default_epochs=epochs)
                 exp_name = f"{name_prefix}{k}_{Path(model).stem}_{suffix}"
+                run_dir = Path(project) / exp_name
+                weights_dir = run_dir / "weights"
+                best = weights_dir / "best.pt"
+                last = weights_dir / "last.pt"
+                done_marker = run_dir / "train_cv.done"
 
                 print(f"\n[PY] yolo {task} train  (with augmentations={aug_list is not None})")
 
-                y = YOLO(model)  # OBB対応の重み/モデルをロード
+                if args.resume and done_marker.exists():
+                    print(f"[RESUME] skip completed run: {run_dir}")
+                    continue
 
-                # train() に重複引数を渡さないように除去
-                safe_train = dict(this_train)
-                for k_rm in ["imgsz", "data", "project", "name", "device"]:
-                    safe_train.pop(k_rm, None)
+                resume_from_last = False
+                skip_train = False
+                if args.resume:
+                    if last.exists() and not train_reached_target_epochs(run_dir, epochs):
+                        resume_from_last = True
+                        print(f"[RESUME] resume training from: {last}")
+                    elif best.exists():
+                        skip_train = True
+                        print(f"[RESUME] training already has weights; run validation only: {best}")
 
-                y.train(
-                    data=str(data_yaml),
-                    project=project,
-                    name=exp_name,
-                    device=device,
-                    imgsz=imgsz,
-                    augmentations=aug_list,
-                    **safe_train,         
-                )
+                if not skip_train:
+                    y = YOLO(str(last) if resume_from_last else model)  # OBB対応の重み/モデルをロード
 
-                best = Path(project) / exp_name / "weights" / "best.pt"
+                    # train() に重複引数を渡さないように除去
+                    safe_train = dict(this_train)
+                    for k_rm in ["imgsz", "data", "project", "name", "device", "model", "resume"]:
+                        safe_train.pop(k_rm, None)
+
+                    train_kwargs = dict(
+                        data=str(data_yaml),
+                        project=project,
+                        name=exp_name,
+                        device=device,
+                        imgsz=imgsz,
+                        augmentations=aug_list,
+                        **safe_train,
+                    )
+                    if resume_from_last:
+                        train_kwargs["resume"] = True
+
+                    y.train(**train_kwargs)
 
                 # val on val split
                 print(f"[PY] yolo {task} val (val split)")
-                y_best = YOLO(str(best))
+                eval_weights = best if best.exists() else last
+                assert eval_weights.exists(), f"missing weights for validation: {eval_weights}"
+                y_best = YOLO(str(eval_weights))
                 y_best.val(
                     data=str(data_yaml),
                     imgsz=imgsz,
                     **val_hp
                 )
+                done_marker.write_text("done\n", encoding="utf-8")
 
 if __name__ == "__main__":
     main()
