@@ -151,6 +151,7 @@ def _predict_obb_with_sahi(
     *,
     conf: float,
     device: str | None,
+    imgsz: int,
     slice_w: int,
     slice_h: int,
     ovw: float,
@@ -173,6 +174,7 @@ def _predict_obb_with_sahi(
         model_path=weights_path,
         confidence_threshold=conf,
         device=_normalize_sahi_device(device),
+        image_size=imgsz,
     )
 
     # SAHI expects RGB
@@ -417,6 +419,7 @@ def main():
                 img_bgr=img_np,
                 conf=args.conf,
                 device=args.device,
+                imgsz=args.imgsz,
                 slice_w=args.slice_width,
                 slice_h=args.slice_height,
                 ovw=args.overlap_width_ratio,
