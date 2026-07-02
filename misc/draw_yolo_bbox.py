@@ -17,7 +17,7 @@ YOLO OBB 可視化ツール（回転矩形 or 4点ポリゴン）
   -o, --out           出力ディレクトリ（未作成なら自動作成）
   -t, --thickness     線の太さ（px, 既定:2）
   -m, --min-area      描画する最小面積（px^2, 既定:0=制限なし）
-  -k, --skip-missing  対応ラベルが無い画像をスキップ（指定なしならラベル無しでも画像だけ保存）
+  -k, --skip-missing  描画可能なbboxが無い画像をスキップ
   -x, --exts          読む拡張子カンマ区切り（既定:"jpg,jpeg,png,bmp,tif,tiff,webp"）
   -c, --classnames    クラス名テキスト（1行1クラス, 任意）
   --draw-center       OBB/ポリゴンの中心点を描く
@@ -41,7 +41,8 @@ def parse_args():
     ap.add_argument("-o", "--out", required=True, type=Path, help="Output directory")
     ap.add_argument("-t", "--thickness", type=int, default=2, help="Line thickness (px)")
     ap.add_argument("-m", "--min-area", type=int, default=0, help="Minimum polygon area to draw (px^2)")
-    ap.add_argument("-k", "--skip-missing", action="store_true", help="Skip images without label file")
+    ap.add_argument("-k", "--skip-missing", action="store_true",
+                    help="Skip images without any drawable bbox (missing/empty/invalid label or filtered by --min-area)")
     ap.add_argument("-x", "--exts", type=str, default=",".join(IMG_EXTS_DEFAULT),
                     help="Comma-separated image extensions (no dot)")
     ap.add_argument("-c", "--classnames", type=Path, default=None,
@@ -309,7 +310,8 @@ def draw_poly(img, pts: np.ndarray, color, thickness: int):
     cv2.polylines(img, [pts_i], isClosed=True, color=color, thickness=thickness)
 
 def draw_one_image(img_path: Path, label_path: Path, out_dir: Path, thickness: int,
-                   min_area: int, classnames, draw_center: bool, force_fmt: str):
+                   min_area: int, classnames, draw_center: bool, force_fmt: str,
+                   skip_empty: bool = False):
     img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img is None:
         print(f"[WARN] cannot read image: {img_path}", file=sys.stderr)
@@ -317,10 +319,15 @@ def draw_one_image(img_path: Path, label_path: Path, out_dir: Path, thickness: i
     H, W = img.shape[:2]
 
     anns = read_labels_file(label_path, W, H, force_fmt)
-    for fmt, cls, pts, (cx, cy), conf in anns:
-        area = poly_area(pts)
-        if min_area > 0 and area < min_area:
-            continue
+    drawable_anns = [
+        ann for ann in anns
+        if min_area <= 0 or poly_area(ann[2]) >= min_area
+    ]
+    if skip_empty and not drawable_anns:
+        print(f"[INFO] skip (no drawable bbox): {img_path}", file=sys.stderr)
+        return False
+
+    for fmt, cls, pts, (cx, cy), conf in drawable_anns:
 
         color = color_for_class(cls)
         draw_poly(img, pts, color, thickness)
@@ -379,7 +386,8 @@ def main():
             print(f"[DONE] wrote 0 images to: {args.out}")
             return 0
         ok = draw_one_image(args.input, label_path, args.out, args.thickness,
-                            args.min_area, classnames, args.draw_center, args.format)
+                            args.min_area, classnames, args.draw_center, args.format,
+                            skip_empty=args.skip_missing)
         print(f"[DONE] wrote {1 if ok else 0} images to: {args.out}")
         return 0
 
@@ -414,7 +422,8 @@ def main():
                 print(f"[INFO] label not found, drawing none: {label_path}", file=sys.stderr)
 
         ok = draw_one_image(img_path, label_path, out_dir, args.thickness,
-                            args.min_area, classnames, args.draw_center, args.format)
+                            args.min_area, classnames, args.draw_center, args.format,
+                            skip_empty=args.skip_missing)
         if ok:
             n_ok += 1
 
