@@ -17,7 +17,7 @@ YOLO OBB 可視化ツール（回転矩形 or 4点ポリゴン）
   -o, --out           出力ディレクトリ（未作成なら自動作成）
   -t, --thickness     線の太さ（px, 既定:2）
   -m, --min-area      描画する最小面積（px^2, 既定:0=制限なし）
-  -k, --skip-missing  対応ラベルが無い画像をスキップ（指定なしならラベル無しでも画像だけ保存）
+  -k, --skip-missing  描画可能なbboxが無い画像をスキップ
   -x, --exts          読む拡張子カンマ区切り（既定:"jpg,jpeg,png,bmp,tif,tiff,webp"）
   -c, --classnames    クラス名テキスト（1行1クラス, 任意）
   --draw-center       OBB/ポリゴンの中心点を描く
@@ -29,6 +29,7 @@ from pathlib import Path
 import cv2
 import sys
 import math
+import ast
 import numpy as np
 
 IMG_EXTS_DEFAULT = ["jpg","jpeg","png","bmp","tif","tiff","webp"]
@@ -40,15 +41,121 @@ def parse_args():
     ap.add_argument("-o", "--out", required=True, type=Path, help="Output directory")
     ap.add_argument("-t", "--thickness", type=int, default=2, help="Line thickness (px)")
     ap.add_argument("-m", "--min-area", type=int, default=0, help="Minimum polygon area to draw (px^2)")
-    ap.add_argument("-k", "--skip-missing", action="store_true", help="Skip images without label file")
+    ap.add_argument("-k", "--skip-missing", action="store_true",
+                    help="Skip images without any drawable bbox (missing/empty/invalid label or filtered by --min-area)")
     ap.add_argument("-x", "--exts", type=str, default=",".join(IMG_EXTS_DEFAULT),
                     help="Comma-separated image extensions (no dot)")
     ap.add_argument("-c", "--classnames", type=Path, default=None,
-                    help="Optional classes.txt (one class name per line)")
+                    help="Optional classes.txt (one class name per line). YAML is also accepted.")
+    ap.add_argument("-d", "--data-yaml", type=Path, default=None,
+                    help="Optional YOLO data.yaml to load class names from its 'names' field")
+    ap.add_argument("--max-images", type=int, default=None,
+                    help="Maximum number of images to save (default: no limit)")
     ap.add_argument("--draw-center", action="store_true", help="Draw center point")
     ap.add_argument("--format", choices=["auto","obb","poly"], default="auto",
                     help="Force parse format: 'auto' (default), 'obb' (xc,yc,w,h,angle), or 'poly' (x1..y4)")
     return ap.parse_args()
+
+def _names_from_yaml_value(value):
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, dict):
+        names = []
+        for k in sorted(value, key=lambda x: int(x) if str(x).isdigit() else str(x)):
+            names.append(str(value[k]))
+        return names
+    return None
+
+def _load_names_with_pyyaml(path: Path):
+    try:
+        import yaml
+    except ImportError:
+        return None
+
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if isinstance(data, dict):
+        return _names_from_yaml_value(data.get("names"))
+    return None
+
+def _load_names_with_simple_yaml(path: Path):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    names = None
+    names_map = None
+    in_names = False
+
+    for raw in lines:
+        line = raw.split("#", 1)[0].rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if in_names:
+            if stripped.startswith("-"):
+                if names is None:
+                    names = []
+                names.append(stripped[1:].strip().strip("'\""))
+                continue
+            if ":" in stripped and raw.startswith((" ", "\t")):
+                if names_map is None:
+                    names_map = {}
+                k, v = stripped.split(":", 1)
+                names_map[k.strip().strip("'\"")] = v.strip().strip("'\"")
+                continue
+            if ":" in stripped and not raw.startswith((" ", "\t")):
+                in_names = False
+            else:
+                continue
+
+        if not stripped.startswith("names:"):
+            continue
+
+        value = stripped.split(":", 1)[1].strip()
+        if not value:
+            names = []
+            in_names = True
+            continue
+
+        try:
+            parsed = ast.literal_eval(value)
+            loaded = _names_from_yaml_value(parsed)
+            if loaded is not None:
+                return loaded
+        except (ValueError, SyntaxError):
+            pass
+
+        if value.startswith("{") and value.endswith("}"):
+            pairs = {}
+            for item in value[1:-1].split(","):
+                if ":" not in item:
+                    continue
+                k, v = item.split(":", 1)
+                pairs[k.strip().strip("'\"")] = v.strip().strip("'\"")
+            return _names_from_yaml_value(pairs)
+
+    if names_map is not None:
+        return _names_from_yaml_value(names_map)
+    return names
+
+def load_classnames_from_data_yaml(path: Path|None):
+    if not path:
+        return None
+    if not path.exists():
+        print(f"[WARN] data.yaml not found: {path}", file=sys.stderr)
+        return None
+
+    try:
+        names = _load_names_with_pyyaml(path)
+    except Exception as e:
+        print(f"[WARN] failed to parse data.yaml with PyYAML: {path}: {e}", file=sys.stderr)
+        names = None
+
+    if names is None:
+        names = _load_names_with_simple_yaml(path)
+
+    if names is None:
+        print(f"[WARN] no 'names' field found in data.yaml: {path}", file=sys.stderr)
+    return names
 
 def load_classnames(path: Path|None):
     if not path:
@@ -56,6 +163,8 @@ def load_classnames(path: Path|None):
     if not path.exists():
         print(f"[WARN] classnames file not found: {path}", file=sys.stderr)
         return None
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        return load_classnames_from_data_yaml(path)
     with path.open("r", encoding="utf-8") as f:
         names = [line.strip() for line in f if line.strip() != ""]
     return names
@@ -201,7 +310,8 @@ def draw_poly(img, pts: np.ndarray, color, thickness: int):
     cv2.polylines(img, [pts_i], isClosed=True, color=color, thickness=thickness)
 
 def draw_one_image(img_path: Path, label_path: Path, out_dir: Path, thickness: int,
-                   min_area: int, classnames, draw_center: bool, force_fmt: str):
+                   min_area: int, classnames, draw_center: bool, force_fmt: str,
+                   skip_empty: bool = False):
     img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img is None:
         print(f"[WARN] cannot read image: {img_path}", file=sys.stderr)
@@ -209,10 +319,15 @@ def draw_one_image(img_path: Path, label_path: Path, out_dir: Path, thickness: i
     H, W = img.shape[:2]
 
     anns = read_labels_file(label_path, W, H, force_fmt)
-    for fmt, cls, pts, (cx, cy), conf in anns:
-        area = poly_area(pts)
-        if min_area > 0 and area < min_area:
-            continue
+    drawable_anns = [
+        ann for ann in anns
+        if min_area <= 0 or poly_area(ann[2]) >= min_area
+    ]
+    if skip_empty and not drawable_anns:
+        print(f"[INFO] skip (no drawable bbox): {img_path}", file=sys.stderr)
+        return False
+
+    for fmt, cls, pts, (cx, cy), conf in drawable_anns:
 
         color = color_for_class(cls)
         draw_poly(img, pts, color, thickness)
@@ -247,7 +362,11 @@ def draw_one_image(img_path: Path, label_path: Path, out_dir: Path, thickness: i
 
 def main():
     args = parse_args()
-    classnames = load_classnames(args.classnames)
+    if args.max_images is not None and args.max_images < 0:
+        print(f"[ERROR] --max-images must be >= 0: {args.max_images}", file=sys.stderr)
+        return 1
+
+    classnames = load_classnames(args.classnames) or load_classnames_from_data_yaml(args.data_yaml)
     exts = ["." + e.lower().strip() for e in args.exts.split(",") if e.strip()]
 
     # 入力: ファイル or ディレクトリ
@@ -263,8 +382,13 @@ def main():
                 return 0
             else:
                 print(f"[INFO] label not found, drawing none: {label_path}", file=sys.stderr)
-        draw_one_image(args.input, label_path, args.out, args.thickness,
-                       args.min_area, classnames, args.draw_center, args.format)
+        if args.max_images == 0:
+            print(f"[DONE] wrote 0 images to: {args.out}")
+            return 0
+        ok = draw_one_image(args.input, label_path, args.out, args.thickness,
+                            args.min_area, classnames, args.draw_center, args.format,
+                            skip_empty=args.skip_missing)
+        print(f"[DONE] wrote {1 if ok else 0} images to: {args.out}")
         return 0
 
     # ディレクトリ一括
@@ -283,6 +407,9 @@ def main():
 
     n_ok = 0
     for img_path in img_paths:
+        if args.max_images is not None and n_ok >= args.max_images:
+            break
+
         rel = img_path.relative_to(args.input)
         out_dir = args.out / rel.parent
 
@@ -295,7 +422,8 @@ def main():
                 print(f"[INFO] label not found, drawing none: {label_path}", file=sys.stderr)
 
         ok = draw_one_image(img_path, label_path, out_dir, args.thickness,
-                            args.min_area, classnames, args.draw_center, args.format)
+                            args.min_area, classnames, args.draw_center, args.format,
+                            skip_empty=args.skip_missing)
         if ok:
             n_ok += 1
 

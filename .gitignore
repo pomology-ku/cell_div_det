@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and local tooling
+.vscode/
+.idea/
+.agents/
+.codex/
+
+# Model weights and exported models
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Local datasets
+dat/
+data/
+datasets/
+
+# Training, evaluation, and report outputs
+runs/
+runs_obb/
+results/
+reports/
+reports_curves/
+
+# OS files
+.DS_Store
+Thumbs.db

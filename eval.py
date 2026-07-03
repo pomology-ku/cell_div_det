@@ -725,6 +725,8 @@ def main():
     ap.add_argument("--out", '-o', required=True, help="output directory")
     ap.add_argument("--split", default="test", choices=["test", "val", "train"], help="which split")
     ap.add_argument("--conf", type=str, default="0.25", help="confidence threshold(s) for predictions (comma-separated)")
+    ap.add_argument("--vis_conf", type=float, default=None,
+                    help="confidence threshold whose overlay images are saved; must be included in --conf")
     ap.add_argument("--iou", type=float, default=0.70, help="NMS IoU threshold (per-call)")
     ap.add_argument("--angle_unit", choices=["deg", "rad"], default="deg", help="GT angle unit")
     ap.add_argument("--thick", type=int, default=4, help="line thickness for overlay")
@@ -808,6 +810,8 @@ def main():
             pass  # Ultralytics handles device generally via predict/val args
 
     conf_list = parse_conf_list(args.conf)
+    if args.vis_conf is not None and not any(np.isclose(args.vis_conf, conf) for conf in conf_list):
+        ap.error(f"--vis_conf {args.vis_conf} must be included in --conf ({args.conf})")
     summaries = []
 
     def run_eval_for_conf(conf: float) -> dict:
@@ -938,9 +942,11 @@ def main():
                 cv2.putText(canvas, pred_legend, (140, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, C_PR, 2, cv2.LINE_AA)
                 cv2.line(canvas, (270, y0-8), (430, y0-8), C_PR, thick, cv2.LINE_AA)
 
-                out_path = out_dir / f"{img_path.stem}_gt_pred.png"
-                cv2.imwrite(str(out_path), canvas)
-                print(f"[{i}/{len(img_paths)}] saved -> {out_path}")
+                save_visuals = args.vis_conf is None or np.isclose(conf, args.vis_conf)
+                if save_visuals and (gt_items or len(polys) > 0):
+                    out_path = out_dir / f"{img_path.stem}_gt_pred.png"
+                    cv2.imwrite(str(out_path), canvas)
+                    print(f"[{i}/{len(img_paths)}] saved -> {out_path}")
 
                 pred_items = []
                 for poly, cls, pred_conf in zip(polys, pred_classes, pred_confs):

@@ -53,6 +53,7 @@ except Exception:
     get_sliced_prediction = None
 
 IMG_EXT = ".tif"
+DEFAULT_CLASS_NAMES_JSON = Path(__file__).with_name("class_names.json")
 
 # ---------- 幾何ユーティリティ ----------
 
@@ -151,6 +152,7 @@ def _predict_obb_with_sahi(
     *,
     conf: float,
     device: str | None,
+    imgsz: int,
     slice_w: int,
     slice_h: int,
     ovw: float,
@@ -173,6 +175,7 @@ def _predict_obb_with_sahi(
         model_path=weights_path,
         confidence_threshold=conf,
         device=_normalize_sahi_device(device),
+        image_size=imgsz,
     )
 
     # SAHI expects RGB
@@ -297,6 +300,11 @@ def main():
     ap = argparse.ArgumentParser(description="Export COCO JSON and/or Ultralytics YOLO-OBB labels from YOLO OBB inference")
     ap.add_argument("-d", "--dir", required=True, help="Directory containing .tif images (non-recursive)")
     ap.add_argument("-m", "--model", required=True, help="Path to YOLO11-OBB model (.pt)")
+    ap.add_argument(
+        "--class-names-json",
+        default=str(DEFAULT_CLASS_NAMES_JSON),
+        help="JSON mapping from zero-based class ID to name (default: class_names.json next to this script)",
+    )
     # (A) COCO JSON
     ap.add_argument("--out-json", default=None, help="Output COCO JSON path (if set, export COCO)")
     ap.add_argument("--cvat-root", type=str, default="", help="COCO images[].file_name の先頭に付ける相対ルート")
@@ -354,13 +362,28 @@ def main():
 
     # モデル・クラス名
     model = YOLO(args.model)
-    names = getattr(model, "names", {})
-    if isinstance(names, dict) and names:
-        class_names = [names[k] for k in sorted(names.keys())]
-    elif isinstance(names, (list, tuple)) and len(names) > 0:
-        class_names = list(names)
-    else:
-        class_names = ["object"]
+    names_path = Path(args.class_names_json)
+    try:
+        with names_path.open("r", encoding="utf-8") as f:
+            configured_names = json.load(f)
+        if not isinstance(configured_names, dict) or not configured_names:
+            raise ValueError("top-level value must be a non-empty object")
+        names_by_id = {int(k): str(v) for k, v in configured_names.items()}
+        expected_ids = list(range(len(names_by_id)))
+        if sorted(names_by_id) != expected_ids:
+            raise ValueError(f"class IDs must be contiguous from 0: expected {expected_ids}")
+        class_names = [names_by_id[i] for i in expected_ids]
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        raise SystemExit(f"Failed to load --class-names-json {names_path}: {e}") from e
+
+    model_names = getattr(model, "names", {})
+    model_class_count = len(model_names) if isinstance(model_names, (dict, list, tuple)) else 0
+    if model_class_count and model_class_count != len(class_names):
+        raise SystemExit(
+            f"Class count mismatch: model has {model_class_count}, "
+            f"but {names_path} defines {len(class_names)}"
+        )
+    print(f"[INFO] Class names: {dict(enumerate(class_names))} (from {names_path})")
 
     # (A) COCO JSON 準備
     if args.out_json:
@@ -417,6 +440,7 @@ def main():
                 img_bgr=img_np,
                 conf=args.conf,
                 device=args.device,
+                imgsz=args.imgsz,
                 slice_w=args.slice_width,
                 slice_h=args.slice_height,
                 ovw=args.overlap_width_ratio,
@@ -470,10 +494,11 @@ def main():
                     "id": ann_id,
                     "image_id": img_id,
                     "category_id": int(cls_idx) + 1,  # 1始まり
-                    #"segmentation": [arr.tolist()],   # COCOは list[list[...]]
-                    #"area": area,
+                    "segmentation": [arr.tolist()],   # OBB polygon (pixel coords, 8 values)
+                    "area": area,
                     "bbox": [float(b) for b in bbox],
                     "iscrowd": 0,
+                    "score": float(score),
                 })
                 ann_id += 1
 
