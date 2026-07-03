@@ -3,7 +3,7 @@
 """
 Export a CVAT-importable COCO JSON + filtered images from inference_obb.py output.
 
-Reads one or two COCO JSONs (two models → union of detections per image).
+Reads one or two COCO JSONs (two models → concatenated detections per image).
 Only images that have at least one detection are copied.
 
 Default output (COCO 1.0 for CVAT):
@@ -29,15 +29,16 @@ Note:
   - segmentation field (OBB polygon, pixel coords) must be present in input COCO JSON.
     inference_obb.py writes it automatically.
   - If segmentation is absent, falls back to AABB bbox as axis-aligned OBB.
-  - Detections from both JSONs are merged per image (union).
+  - Detections from both JSONs are concatenated per image; overlapping or identical
+    detections are not de-duplicated.
   - --conf filters by the "score" field written by inference_obb.py.
 """
 
 import argparse
 import json
-import math
 import shutil
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -98,12 +99,19 @@ def polygon_area(poly8: list[float]) -> float:
     return abs(area) / 2.0
 
 
+@lru_cache(maxsize=None)
+def _image_files_by_stem(img_dir: Path, exts: tuple[str, ...]) -> dict[str, Path]:
+    """Build one reusable image index for each source directory/extension set."""
+    return {
+        p.stem.lower(): p
+        for p in img_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in exts
+    }
+
+
 def find_image_file(stem_lower: str, img_dir: Path,
                     exts=(".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")) -> Path | None:
-    for p in img_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in exts and p.stem.lower() == stem_lower:
-            return p
-    return None
+    return _image_files_by_stem(img_dir, tuple(exts)).get(stem_lower)
 
 
 # --------------------------------------------------------------------------- #

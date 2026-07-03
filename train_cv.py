@@ -201,7 +201,8 @@ def main():
 
                 print(f"\n[PY] yolo {task} train  (with augmentations={aug_list is not None})")
 
-                if args.resume and done_marker.exists():
+                if (args.resume and done_marker.exists()
+                        and train_reached_target_epochs(run_dir, epochs)):
                     print(f"[RESUME] skip completed run: {run_dir}")
                     continue
 
